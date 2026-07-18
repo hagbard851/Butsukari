@@ -36,11 +36,7 @@ const WORKOUTS = {
       { id: "kb-swing",  name: "KB Swing",               sets: 4, reps: "15",       w: 22.5, unit: "lbs" },
       { id: "sumo-dl",   name: "Sumo Deadlift",          sets: 4, reps: "6",        w: 40,   unit: "lbs" },
       { id: "pullups",   name: "Pull-ups Assisted",      sets: 5, reps: "5",        w: 60,   unit: "lbs assist", down: true },
-      { id: "row",       name: "Row",                     sets: 4, reps: "2\u00D715 + 2\u00D710/s", w: 100, unit: "lbs", alt: "cable-row",
-        parts: [
-          { field: "weight",  label: "Two-hand",           sets: 2, reps: "15",      w: 100, inc: 5,   alt: "cable-row" },
-          { field: "weight2", label: "One-hand \u00B7 L lead", sets: 2, reps: "10/side", w: 40,  inc: 2.5, alt: null }
-        ] },
+      { id: "row",       name: "Row",                     sets: 4, reps: "12",      w: 100, unit: "lbs", alt: "cable-row" },
       { id: "pushups",   name: "Push-ups",                sets: 3, reps: "5",        w: 5,    unit: "reps", trackReps: true },
       { id: "bss",       name: "Bulgarian Split Squat",  sets: 3, reps: "10/side",  w: 10,   unit: "lbs ea" },
       { id: "farmer",    name: "Farmer Carries",          sets: 3, reps: "40 sec",   w: 30,   unit: "lbs ea" },
@@ -61,8 +57,7 @@ const WORKOUTS = {
       { id: "goblet",       name: "Goblet Squat",                sets: 4, reps: "8",         w: 30,  unit: "lbs" },
       { id: "arnold",       name: "Arnold Press",                sets: 3, reps: "8",         w: 15,  unit: "lbs" },
       { id: "face-pull",    name: "Face Pull",                   sets: 3, reps: "15",        w: 15,  unit: "lbs" },
-      { id: "woodchop",     name: "High Woodchop",               sets: 3, reps: "12/side",   w: 25,  unit: "lbs",
-        speedFactor: 0.5, note: "Speed sets first: 2\u00D75/side fast @ ~50% \u2014 max intent, controlled return. Then the 3 tracked sets." },
+      { id: "woodchop",     name: "High Woodchop",               sets: 3, reps: "12/side",   w: 25,  unit: "lbs" },
       { id: "pallof",       name: "Pallof Press",                sets: 3, reps: "8/side",    w: 20,  unit: "lbs" },
       { id: "plank",        name: "Plank",                       sets: 3, reps: "60 sec",    w: 60,  unit: "sec", trackTime: true, alt: "plank-a" },
       { id: "tri-pushdown", name: "Tricep Pushdown",             sets: 3, reps: "12",        w: 30,  unit: "lbs" },
@@ -128,7 +123,7 @@ const SEP_TARGETS = [{
 }, {
   id: "row",
   altId: "cable-row",
-  label: "Row (two-hand)",
+  label: "Row",
   target: 115,
   start: 85
 }, {
@@ -198,6 +193,7 @@ const PROG = {
   'sumo-dl':      { inc: 5 },
   'pullups':      { inc: 2.5, down: true },
   'cable-row':    { inc: 5 },
+  'row':          { inc: 5 },
   'bss':          { inc: 2.5 },
   'glute-a':      { inc: 5 },
   'glute-b':      { inc: 5 },
