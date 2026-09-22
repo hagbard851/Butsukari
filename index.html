@@ -377,7 +377,17 @@ const DB = {
     IDB.del(k);
   }
 };
-const saveCfg = () => DB.set("lobo-gym-cfg", { targets: CFG.targets, sched: CFG.sched, pullupsBW: CFG.pullupsBW });
+const cfgSnapshot = () => ({
+  targets: CFG.targets.map(t => ({ ...t })),
+  sched: { ...CFG.sched },
+  pullupsBW: CFG.pullupsBW
+});
+const saveCfg = () => DB.set("lobo-gym-cfg", cfgSnapshot());
+const cleanSession = s => {
+  if (!s || typeof s !== "object") return s;
+  const { report, ...rest } = s;
+  return rest;
+};
 // Keep the AI-report cooldown on the same durable store
 window.storage = {
   get: async k => {
@@ -2583,21 +2593,23 @@ function GymTracker() {
       try {
       const s = await DB.get("lobo-gym");
       if (Array.isArray(s)) {
-        setSessions(s);
-        IDB.set("lobo-gym", s); // one-time migration localStorage → IndexedDB
+        const clean = s.map(cleanSession);
+        setSessions(clean);
+        DB.set("lobo-gym", clean); // migrate local history and strip legacy AI reports
       }
       // v15: local-only. Remove API material left by older versions.
       DB.del("lobo-gym-key");
       DB.del("lastApiCall");
       const cfg = await DB.get("lobo-gym-cfg");
       if (cfg && typeof cfg === "object") {
-        if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets;
+        if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets.map(t => ({ ...t }));
         if (cfg.sched && typeof cfg.sched === "object") {
-          CFG.sched = cfg.sched;
+          CFG.sched = { ...cfg.sched };
           // v13→v14 migration: circuit day-code no longer exists
           for (const d in CFG.sched) if (CFG.sched[d] === "C") CFG.sched[d] = "R";
         }
         if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
+        saveCfg(); // rewrites legacy config without removed fields
       }
       const t = await DB.get("lobo-gym-tier");
       if (t != null && ['11', '9', '7'].includes(String(t))) {
@@ -2740,16 +2752,21 @@ function GymTracker() {
       if (!silent) flash("No sessions \u2014 nothing to export");
       return;
     }
-    const blob = new Blob([JSON.stringify({
-      v: 2,
+    const backup = {
+      v: 3,
+      app: "butsukari",
+      appVersion: APP_VERSION,
       exported: new Date().toISOString(),
-      sessions: list
-    }, null, 2)], {
+      sessions: list.map(cleanSession),
+      tier,
+      config: cfgSnapshot()
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
       type: "application/json"
     });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `lobo-gym-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `butsukari-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
@@ -2767,27 +2784,47 @@ function GymTracker() {
     r.onload = ev => {
       try {
         const d = JSON.parse(ev.target.result);
-        const arr = d.sessions || d;
-        if (Array.isArray(arr)) {
-          if (arr.length === 0) {
-            flash("File has no sessions \u2014 nothing imported");
-            return;
+        const arr = Array.isArray(d) ? d : d.sessions;
+        if (!Array.isArray(arr)) {
+          flash("Invalid backup file");
+          return;
+        }
+
+        // Merge by id: importing can add history, never erase existing sessions.
+        const byId = new Map(sessions.map(s => [s.id, cleanSession(s)]));
+        let added = 0;
+        arr.forEach(raw => {
+          const s = cleanSession(raw);
+          if (s && s.id != null && s.entries !== undefined && !byId.has(s.id)) {
+            byId.set(s.id, s);
+            added++;
           }
-          // Merge by id — import can only ever ADD sessions, never wipe.
-          const byId = new Map(sessions.map(s => [s.id, s]));
-          let added = 0;
-          arr.forEach(s => {
-            if (s && s.id != null && s.entries !== undefined && !byId.has(s.id)) {
-              byId.set(s.id, s);
-              added++;
-            }
-          });
-          const merged = [...byId.values()].sort((a, b) => new Date(a.date) - new Date(b.date));
-          persist(merged);
-          flash(added > 0 ? `Imported ${added} new session${added > 1 ? "s" : ""} \u2713` : "No new sessions in file");
-        } else flash("Invalid file");
+        });
+        const merged = [...byId.values()].sort((a, b) => new Date(a.date) - new Date(b.date));
+        persist(merged);
+
+        let restoredPlan = false;
+        if (!Array.isArray(d) && d.config && typeof d.config === "object") {
+          const cfg = d.config;
+          if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets.map(t => ({ ...t }));
+          if (cfg.sched && typeof cfg.sched === "object") CFG.sched = { ...cfg.sched };
+          if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
+          saveCfg();
+          bumpCfg();
+          restoredPlan = true;
+        }
+        if (!Array.isArray(d) && ['11', '9', '7'].includes(String(d.tier))) {
+          setTierState(String(d.tier));
+          DB.set("lobo-gym-tier", String(d.tier));
+          restoredPlan = true;
+        }
+
+        const sessionMsg = added > 0
+          ? `Imported ${added} new session${added > 1 ? "s" : ""}`
+          : "No new sessions";
+        flash(restoredPlan ? sessionMsg + " \u00B7 plan restored \u2713" : sessionMsg + " \u2713");
       } catch {
-        flash("Could not read file");
+        flash("Could not read backup file");
       }
     };
     r.readAsText(f);
