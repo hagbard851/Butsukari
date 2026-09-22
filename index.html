@@ -23,7 +23,7 @@
   useRef,
   useCallback
 } = React;
-const APP_VERSION = "15.1";
+const APP_VERSION = "15.2";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -404,11 +404,36 @@ function getHistory(sessions, id, altId = null, field = "weight") {
   const result = [];
   for (const s of sessions) {
     const e = s.entries?.[id] ?? (altId ? s.entries?.[altId] : null);
-    if (e && e[field] != null && e[field] !== "") result.push({
-      date: s.date,
-      weight: Number(e[field]),
-      setsCompleted: e.sets || 0,
-      reqSets: e.req || null
+    const setsCompleted = Number(e?.sets) || 0;
+
+    // Prefilled-but-untouched exercises are not attempts.
+    if (!e || setsCompleted <= 0) continue;
+
+    let weight = e[field] != null && e[field] !== "" ? Number(e[field]) : null;
+    let setLoads = null;
+    let mixedLoad = false;
+
+    // v15.2+: each completed set captures the load actually used.
+    // The final performed set becomes the anchor for the next session.
+    if (field === "weight" && Array.isArray(e.setLoads) && e.setLoads.length) {
+      setLoads = e.setLoads
+        .slice(0, setsCompleted)
+        .map(Number)
+        .filter(Number.isFinite);
+      if (setLoads.length) {
+        weight = setLoads[setLoads.length - 1];
+        mixedLoad = setLoads.some(w => w !== weight);
+      }
+    }
+
+    if (!Number.isFinite(weight)) continue;
+    result.push({
+      date: s.endDate || s.date,
+      weight,
+      setsCompleted,
+      reqSets: e.req || null,
+      setLoads,
+      mixedLoad
     });
   }
   return result.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -431,6 +456,11 @@ const fmtTime = iso => new Date(iso).toLocaleTimeString("en-CA", {
   minute: "2-digit"
 });
 const round2_5 = n => Math.round(n / 2.5) * 2.5;
+const roundTo = (n, step = 2.5) => {
+  const s = Number(step) > 0 ? Number(step) : 2.5;
+  return Math.round(n / s) * s;
+};
+const LAYOFF_DAYS = 21;
 const displayDate = s => s.endDate || s.date;
 
 // ─── PROGRESSION ──────────────────────────────────────────────────────────────
@@ -441,6 +471,8 @@ const displayDate = s => s.endDate || s.date;
 function smartCore(history, prog, ex, defaultSets, startW) {
   const unitW = ex.trackTime ? "sec" : ex.trackReps ? "reps" : "lbs";
   const doneOf = h => h.setsCompleted >= (h.reqSets || defaultSets);
+  const cleanDoneOf = h => doneOf(h) && !h.mixedLoad;
+
   if (history.length === 0) return {
     currentWeight: startW,
     nextWeight: null,
@@ -449,52 +481,80 @@ function smartCore(history, prog, ex, defaultSets, startW) {
     color: '#88847F',
     tip: 'First session — log your working weight.'
   };
+
   const last = history[history.length - 1];
   const cw = last.weight;
-  const lastCompleted = doneOf(last);
+  const daysSince = Math.max(0, (Date.now() - new Date(last.date).getTime()) / 86400000);
+
+  if (last.mixedLoad) return {
+    currentWeight: cw,
+    nextWeight: null,
+    status: 'reset',
+    label: 'RESET',
+    color: '#E8952A',
+    tip: `Load changed during the last session. Next session starts from the final performed load: ${cw} ${ex.unit || unitW}.`
+  };
+
+  if (daysSince >= LAYOFF_DAYS) return {
+    currentWeight: cw,
+    nextWeight: null,
+    status: 'return',
+    label: 'RETURN',
+    color: '#E8952A',
+    tip: `${Math.floor(daysSince)} days since this exercise. No automatic increase — re-establish ${cw} ${ex.unit || unitW} or adjust lower if needed.`
+  };
+
   const nw = prog.down ? Math.max(0, cw - prog.inc) : cw + prog.inc;
   const recent = history.slice(-3);
-  const plateau = recent.length >= 3 && recent.every(h => h.weight === cw) && recent.every(h => !doneOf(h));
+  const plateau = recent.length >= 3 &&
+    recent.every(h => h.weight === cw) &&
+    recent.every(h => !doneOf(h) && !h.mixedLoad);
+
   let streak = 0;
   for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].weight === cw && doneOf(history[i])) streak++;
+    if (history[i].weight === cw && cleanDoneOf(history[i])) streak++;
     else break;
   }
+
   if (plateau) {
-    const dw = Math.max(0, round2_5(prog.down ? cw * 1.1 : cw * 0.9));
+    const factor = prog.down ? 1.1 : 0.9;
+    const dw = Math.max(0, roundTo(cw * factor, prog.inc));
     return {
       currentWeight: cw,
       nextWeight: dw,
       status: 'deload',
       label: 'DELOAD',
       color: '#E05858',
-      tip: `Same weight, incomplete sets × 3 sessions. Deload to ${dw} ${ex.unit || unitW} — recovery then reload.`
+      tip: `Same load, genuinely attempted but incomplete × 3 sessions. Deload to ${dw} ${ex.unit || unitW} — recover, then reload.`
     };
   }
-  if (lastCompleted && streak >= 2) return {
+
+  if (cleanDoneOf(last) && streak >= 2) return {
     currentWeight: cw,
     nextWeight: nw,
     status: 'ready',
     label: prog.down ? 'READY ↓' : 'READY ↑',
     color: '#4EC97A',
     streak,
-    tip: `${streak} consecutive completions — ${prog.down ? `reduce assist by ${prog.inc} lbs` : `add ${prog.inc} ${unitW}`} next session.`
+    tip: `${streak} consecutive clean completions — ${prog.down ? `reduce assist by ${prog.inc} lbs` : `add ${prog.inc} ${unitW}`} next session.`
   };
-  if (lastCompleted && streak === 1) return {
+
+  if (cleanDoneOf(last) && streak === 1) return {
     currentWeight: cw,
     nextWeight: nw,
     status: '1of2',
     label: '1 OF 2',
     color: '#E8952A',
-    tip: `All sets done once. One more session at ${cw} ${ex.unit} — then move to ${nw}.`
+    tip: `All prescribed sets completed once at ${cw} ${ex.unit || unitW}. Repeat it once more before progressing to ${nw}.`
   };
+
   return {
     currentWeight: cw,
     nextWeight: null,
     status: 'hold',
     label: 'HOLD',
     color: '#88847F',
-    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} sets completed. Hit all sets before progressing.`
+    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} sets completed. Hit all prescribed sets before progressing.`
   };
 }
 function getSmartNext(sessions, ex) {
@@ -1210,6 +1270,30 @@ function RowParts({
   }));
 }
 
+function getLiveGuidance(entry, smart, ex) {
+  const setsCompleted = Number(entry?.sets) || 0;
+  if (setsCompleted <= 0) return smart;
+
+  const loads = Array.isArray(entry.setLoads)
+    ? entry.setLoads.slice(0, setsCompleted).map(Number).filter(Number.isFinite)
+    : [];
+  if (!loads.length) return smart;
+
+  const anchor = loads[loads.length - 1];
+  const mixed = loads.some(w => w !== anchor);
+  const changedFromHistory = smart && smart.currentWeight != null && anchor !== smart.currentWeight;
+
+  if (mixed || changedFromHistory) return {
+    currentWeight: anchor,
+    nextWeight: null,
+    status: 'reset-live',
+    label: 'TODAY RESET',
+    color: '#E8952A',
+    tip: `Performed load is now ${anchor} ${ex.unit || (ex.trackTime ? "sec" : ex.trackReps ? "reps" : "lbs")}. KITAE will anchor the next session here; this does not count as a progression streak at the old load.`
+  };
+  return smart;
+}
+
 function ExCard({
   ex,
   entry,
@@ -1221,13 +1305,27 @@ function ExCard({
   const setsCompleted = entry.sets || 0;
   const isDone = !!entry.done;
   const [showTip, setShowTip] = useState(false);
-  const smart = getSmartNext(sessions, ex);
+  const historicalSmart = getSmartNext(sessions, ex);
+  const smart = getLiveGuidance(entry, historicalSmart, ex);
   const toggleSet = i => {
     const n = i < setsCompleted ? i : i + 1;
-    onUpdate({
+    const patch = {
       sets: n,
       done: n >= ex.sets
-    });
+    };
+
+    if (!isBW && ex.w !== null && !ex.parts) {
+      const loads = Array.isArray(entry.setLoads) ? [...entry.setLoads] : [];
+      if (n > setsCompleted) {
+        const performed = Number(entry.weight);
+        if (Number.isFinite(performed)) loads[i] = performed;
+      } else {
+        loads.length = n;
+      }
+      patch.setLoads = loads;
+    }
+
+    onUpdate(patch);
   };
   return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2661,7 +2759,7 @@ function GymTracker() {
   const saveEdit = (sid, eid, weight, weight2) => {
     const val = parseFloat(weight);
     if (isNaN(val)) { flash("Invalid weight"); return; }
-    const patch = { weight: val };
+    const patch = { weight: val, setLoads: null };
     if (weight2 !== undefined) {
       const v2 = parseFloat(weight2);
       if (isNaN(v2)) { flash("Invalid weight"); return; }
