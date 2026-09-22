@@ -801,7 +801,6 @@ function Stat({
 }
 
 // ─── TRAINING CYCLE PLAN (season · targets · weekly schedule) ─────────────────
-// ─── TRAINING CYCLE PLAN (season · targets · weekly schedule) ─────────────────
 function PlanPanel({
   sessions,
   onChange
@@ -994,6 +993,23 @@ function PlanPanel({
       fontSize: 12
     }
   }, "\u2192"), numIn(t.target, v => setT(i, "target", v)))), /*#__PURE__*/React.createElement("button", {
+    onClick: prefillFromTrends,
+    style: {
+      width: "100%",
+      padding: "9px",
+      background: "none",
+      border: `1px solid ${C.amber}60`,
+      borderRadius: 8,
+      color: C.amber,
+      cursor: "pointer",
+      fontSize: 11,
+      letterSpacing: 1.5,
+      fontWeight: 700,
+      fontFamily: sans,
+      marginTop: 2,
+      marginBottom: 8
+    }
+  }, "\uD83D\uDCC8 PREFILL FROM TRENDS"), /*#__PURE__*/React.createElement("button", {
     onClick: useCurrent,
     style: {
       width: "100%",
@@ -1066,7 +1082,6 @@ function PlanPanel({
   }, saved ? "SAVED \u2713" : "SAVE PLAN"));
 }
 
-// ─── EXERCISE CARD (session) ───────────────────────────────────────────────────
 // ─── EXERCISE CARD (session) ───────────────────────────────────────────────────
 // ─── ROW PARTS (two-hand + one-hand-left-lead in one exercise) ────────────────
 // Each part tracks its own weight stream and progression; the left hand sets
@@ -2103,7 +2118,6 @@ function HomeView({
   }, "\u2191 IMPORT")));
 }
 
-// ─── HISTORY VIEW ─────────────────────────────────────────────────────────────
 // ─── HISTORY VIEW ─────────────────────────────────────────────────────────────
 function HistoryView({
   sessions,
