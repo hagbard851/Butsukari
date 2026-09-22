@@ -505,14 +505,26 @@ function smartCore(history, prog, ex, defaultSets, startW) {
   };
 
   const nw = prog.down ? Math.max(0, cw - prog.inc) : cw + prog.inc;
-  const recent = history.slice(-3);
+
+  // Progression evidence must also be recent relative to itself. A clean set
+  // from two months ago cannot combine with today's return session to earn an
+  // increase, and old failed attempts cannot manufacture a plateau.
+  const contiguous = [last];
+  for (let i = history.length - 2; i >= 0; i--) {
+    const newer = contiguous[0];
+    const gapDays = (new Date(newer.date).getTime() - new Date(history[i].date).getTime()) / 86400000;
+    if (gapDays >= LAYOFF_DAYS) break;
+    contiguous.unshift(history[i]);
+  }
+
+  const recent = contiguous.slice(-3);
   const plateau = recent.length >= 3 &&
     recent.every(h => h.weight === cw) &&
     recent.every(h => !doneOf(h) && !h.mixedLoad);
 
   let streak = 0;
-  for (let i = history.length - 1; i >= 0; i--) {
-    if (history[i].weight === cw && cleanDoneOf(history[i])) streak++;
+  for (let i = contiguous.length - 1; i >= 0; i--) {
+    if (contiguous[i].weight === cw && cleanDoneOf(contiguous[i])) streak++;
     else break;
   }
 
