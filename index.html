@@ -22,6 +22,7 @@
   useRef,
   useCallback
 } = React;
+const APP_VERSION = "15.0";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -175,14 +176,12 @@ function weeksLeftInSeason(d = new Date()) {
   return Math.max(0.1, (seasonEnd(d) - d) / (86400000 * 7));
 }
 
-// ─── EDITABLE PLAN (targets, weekly schedule, athlete context) ────────────────
+// ─── EDITABLE PLAN (targets, weekly schedule) ────────────────────────────────
 // Persisted under "lobo-gym-cfg". Sched codes: A/B (gym day markers), J (judo), R (rest).
-const DEFAULT_ATHLETE_CTX = "Age 44, 1.72m, ~72kg. Judo brown belt, competes; sessions Mon+Thu, full season from Sept. Medical: early NAFLD (weight mgmt), borderline high BP (no stimulants/creatine, moderate intensity ceiling), lower-back history (no back squat; glute bridge every session is protective, non-negotiable), shoulder history (Arnold press only, face pull = cuff rehab, non-negotiable), left-grip weakness (row one-hand part + left-lead hammer curls are corrective). Philosophy: Tactical Barbell \u2014 submaximal, 1\u20132 reps in the tank, never to failure. Concurrent 16:8 IF fat-loss protocol near goal weight (~70kg).";
 const CFG = {
   targets: SEP_TARGETS.map(t => ({ ...t })),
   sched: { 0: "R", 1: "J", 2: "B", 3: "R", 4: "J", 5: "A", 6: "R" },
-  pullupsBW: false,
-  athleteCtx: DEFAULT_ATHLETE_CTX
+  pullupsBW: false
 };
 const cfgDeadline = () => seasonEnd(); // pacing horizon = end of the current season
 const cfgLabel = () => "END OF " + seasonAt().name;
@@ -378,7 +377,17 @@ const DB = {
     IDB.del(k);
   }
 };
-const saveCfg = () => DB.set("lobo-gym-cfg", { targets: CFG.targets, sched: CFG.sched, pullupsBW: CFG.pullupsBW, athleteCtx: CFG.athleteCtx });
+const cfgSnapshot = () => ({
+  targets: CFG.targets.map(t => ({ ...t })),
+  sched: { ...CFG.sched },
+  pullupsBW: CFG.pullupsBW
+});
+const saveCfg = () => DB.set("lobo-gym-cfg", cfgSnapshot());
+const cleanSession = s => {
+  if (!s || typeof s !== "object") return s;
+  const { report, ...rest } = s;
+  return rest;
+};
 // Keep the AI-report cooldown on the same durable store
 window.storage = {
   get: async k => {
@@ -554,250 +563,7 @@ function getStats(sessions, id, target = null, down = false, altId = null) {
   };
 }
 
-// ─── CLAUDE API ───────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are the strength analyst for Lobo, 44, engineering professor, judo brown belt, training submaximally (Tactical Barbell: 1-2 reps in the tank, never to failure) around two weekly judo sessions. HARAI = hinge+pull day, O-SOTO = push+core day, TRAVEL/OUTDOOR = maintenance.
-
-Medical context (permanent): lower-back history — no spinal flexion under load, glute work is protective; shoulder history — cuff care non-negotiable; borderline BP — no grinding maximal efforts.
-
-You receive computed session data: deltas, progression-engine statuses, target pacing (required vs observed rate), left/right row imbalance, cadence, fatigue signal, the athlete's own session notes, and recent missed sets. Everything is pre-computed — your job is judgment, not arithmetic.
-
-Doctrine:
-- A single lift deloading is normal engine behavior — mention, don't dramatize. But 2+ deloads or 3+ stalls in ONE session is athlete-level fatigue: recommend a lighter week (same lifts, -20%, full rest), not more grinding.
-- ANY pain note outranks everything else in the report. Address it first: name the plausibly affected lift(s), give a conservative next-session modification, and if the same complaint appears across multiple notes, say plainly that it's a pattern warranting a professional look. Never talk him through pain.
-- Season horizon: the athlete's year runs on four seasons — FALL and WINTER are judo seasons (maintain, tier 7), SPRING is a short rebuild (tier 9), SUMMER a short build (tier 11). When under ~3 weeks remain in the current season OR most targets read REACHED, add one SEASON line: name the incoming season and its purpose, and point to Plan panel → AI RECALCULATE to re-anchor targets for it. During judo seasons, holding strength IS the win — report maintenance as success, not stagnation.
-
-Write under 150 words, plain prose or short lines. Cover, in order, only what is true today:
-0. FLAG — only if a pain note or systemic fatigue exists; otherwise omit entirely.
-1. MOVED — what actually progressed, with numbers.
-2. STUCK — stalls, deloads, missed sets, and the likely reason (fatigue pattern? weight jump? cadence gap?).
-3. PACE — only targets running behind their required rate. If none, one word: on pace.
-4. NEXT — the exact weights the engine queued, plus at most ONE coaching cue if the data justifies it.
-
-Rules: no praise filler, no metaphors, no judo references, no restating the obvious. "Nothing notable" is an acceptable sentence. If the data shows a real risk (e.g. repeated misses on a hinge), say it bluntly.`;
-function buildReportPrompt(session, sessions) {
-  const w = sessionMeta(session);
-  const date = fmtFull(displayDate(session));
-  const prevSessions = sessions.filter(s => s.id !== session.id);
-  const sessionExs = (session.exs ? session.exs.map(x => ({ ...EX_BY_ID[x.id], sets: x.sets })) : (WORKOUTS[session.wid]?.exercises || [])).filter(Boolean);
-  const exerciseLines = sessionExs.filter(ex => !ex.bw && session.entries[ex.id]?.weight && session.entries[ex.id].weight !== "").map(ex => {
-    const e = session.entries[ex.id];
-    const req = e.req || ex.sets;
-    if (ex.parts) {
-      const partLines = ex.parts.map(p => {
-        const val = e[p.field];
-        if (val == null || val === "") return null;
-        const lw = getLastW(prevSessions, ex.id, p.alt, p.field);
-        const delta = lw != null ? Number(val) - lw : null;
-        const smart = getSmartNextPart(sessions, ex, p);
-        const progression = smart?.status === 'ready' ? ` → READY for ${smart.nextWeight} next` : smart?.status === '1of2' ? ` (1/2)` : '';
-        return `${p.label} ${val} lbs${delta != null && delta !== 0 ? ` (${delta > 0 ? '+' : ''}${delta})` : ''}${progression}`;
-      }).filter(Boolean).join(' · ');
-      return `  ${ex.name}: ${partLines} × ${e.sets}/${req} sets`;
-    }
-    const lw = getLastW(prevSessions, ex.id, ex.alt);
-    const hist = getHistory(sessions, ex.id, ex.alt);
-    const isNewPR = Number(e.weight) === (ex.down ? Math.min(...hist.map(h => h.weight)) : Math.max(...hist.map(h => h.weight)));
-    const delta = lw != null ? Number(e.weight) - lw : null;
-    const smart = getSmartNext(sessions, ex);
-    const progression = smart?.status === 'ready' ? ` → READY for ${smart.nextWeight} next` : smart?.status === '1of2' ? ` (1/2 completions)` : '';
-    return `  ${ex.name}: ${e.weight} ${ex.unit} × ${e.sets}/${req} sets${isNewPR ? ' [NEW PR]' : ''}${delta != null && delta !== 0 ? ` (${delta > 0 ? '+' : ''}${delta} from last)` : ''}${progression}`;
-  }).join('\n');
-  const targets = CFG.targets.map(t => {
-    const lw = getLastW(sessions, t.id, t.altId);
-    const pct = lw != null ? t.down ? (t.start - lw) / ((t.start - t.target) || 1) * 100 : (lw - t.start) / ((t.target - t.start) || 1) * 100 : 0;
-    return `  ${t.label}: ${lw ?? '?'} → ${t.target} (${Math.round(Math.max(0, Math.min(100, pct)))}%)`;
-  }).join('\n');
-  // ── Computed analysis the model can't do itself ──
-  const weeksLeft = Math.max(0.1, (cfgDeadline() - new Date()) / (86400000 * 7));
-  const pacing = CFG.targets.map(t => {
-    const lw = getLastW(sessions, t.id, t.altId);
-    if (lw == null) return null;
-    const st = getStats(sessions, t.id, null, t.down, t.altId);
-    const observed = st ? st.ratePerWeek : null;
-    const required = t.down ? (lw - t.target) / weeksLeft : (t.target - lw) / weeksLeft;
-    const reqR = Math.round(required * 10) / 10;
-    const obsR = observed != null ? Math.round(observed * 10) / 10 : null;
-    const done = t.down ? lw <= t.target : lw >= t.target;
-    const behind = !done && (obsR == null || (t.down ? -obsR : obsR) < reqR);
-    return `  ${t.label}: at ${lw}, target ${t.target}${t.unit === "sec" ? " sec" : ""} — needs ${reqR}/wk, observed ${obsR ?? "n/a"}/wk → ${done ? "REACHED" : behind ? "BEHIND" : "on pace"}`;
-  }).filter(Boolean).join('\n');
-  // Row L/R imbalance (one-hand as % of two-hand)
-  let imbalance = "";
-  const re = session.entries['row'];
-  if (re && re.weight && re.weight2) {
-    const nowPct = Math.round(Number(re.weight2) / Number(re.weight) * 100);
-    const p2h = getLastW(prevSessions, 'row', 'cable-row');
-    const p1h = getLastW(prevSessions, 'row', null, 'weight2');
-    const prevPct = p2h && p1h ? Math.round(Number(p1h) / Number(p2h) * 100) : null;
-    imbalance = `\nROW L/R IMBALANCE: one-hand is ${nowPct}% of two-hand${prevPct != null ? ` (was ${prevPct}% last time)` : ""}. Rising = left grip closing the gap.`;
-  }
-  // Cadence
-  const sameDay = prevSessions.filter(s => s.wid === session.wid).sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-  const anyPrev = prevSessions.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-  const dayGap = (s2) => s2 ? Math.round((new Date(session.date) - new Date(s2.date)) / 86400000) : null;
-  const cadence = `Days since last ${w.name}: ${dayGap(sameDay) ?? "first"}. Days since last session of any kind: ${dayGap(anyPrev) ?? "first"}.`;
-  // Recent misses (fatigue signal across last 3 sessions incl. this one)
-  const recent = [...prevSessions].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 2).concat([session]);
-  const missMap = {};
-  recent.forEach(s => {
-    for (const [id, e] of Object.entries(s.entries || {})) {
-      const need = e.req || EX_BY_ID[id]?.sets || 3;
-      if (e.sets != null && e.sets < need) missMap[id] = (missMap[id] || 0) + 1;
-    }
-  });
-  const misses = Object.entries(missMap).map(([id, n]) => `  ${EX_BY_ID[id]?.name || id}: incomplete in ${n} of last 3 sessions`).join('\n');
-  // Systemic fatigue: how many of today's lifts are stalled or deloading at once
-  let stallCt = 0, deloadCt = 0;
-  sessionExs.forEach(ex => {
-    const sm = ex.parts ? null : getSmartNext(sessions, ex);
-    if (sm && sm.status === "hold") stallCt++;
-    if (sm && sm.status === "deload") deloadCt++;
-  });
-  const fatigue = `Stalled lifts today: ${stallCt} · Deloading: ${deloadCt}${deloadCt >= 2 || stallCt >= 3 ? " ⚠ SYSTEMIC — pattern exceeds normal per-lift noise" : ""}`;
-  // Athlete notes: this session + the two previous noted sessions
-  const notedPrev = [...prevSessions].filter(s => s.note).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 2);
-  const noteLines = [
-    session.note ? `  TODAY: "${session.note}"` : null,
-    ...notedPrev.map(s => `  ${fmtShort(displayDate(s))}: "${s.note}"`)
-  ].filter(Boolean).join('\n');
-  // Targets reached (for cycle-horizon judgment)
-  const tgtTotal = CFG.targets.length;
-  const tgtDone = CFG.targets.filter(t => {
-    const lw = getLastW(sessions, t.id, t.altId);
-    return lw != null && (t.down ? lw <= t.target : lw >= t.target);
-  }).length;
-  const seas = seasonAt(), seasNext = nextSeason();
-  return `SESSION: ${w.name} — ${w.focus}${session.tier ? ` (tier ${session.tier})` : ''}
-Date: ${date} · ${cadence}
-SEASON: ${seas.name} (${seas.purpose}) · ${Math.round(weeksLeftInSeason() * 10) / 10} weeks left · next: ${seasNext.name} (${seasNext.purpose})
-Total sessions logged: ${sessions.length}
-
-EXERCISES (weight × sets done/required · engine status · queued next weight):
-${exerciseLines}${imbalance}
-
-FATIGUE SIGNAL:
-${fatigue}
-
-ATHLETE NOTES (pain/energy, athlete's own words):
-${noteLines || "  none reported"}
-
-TARGET PACING (horizon: end of ${seasonAt().name}, ${Math.round(weeksLeft * 10) / 10} weeks left · ${tgtDone}/${tgtTotal} targets reached):
-${pacing}
-
-RECENT MISSED SETS:
-${misses || "  none"}
-
-Generate the post-session report.`;
-}
-async function callClaudeAPI(apiKey, session, sessions) {
-  // 12-hour cooldown check
-  const COOLDOWN_MS = 12 * 60 * 60 * 1000;
-  const COOLDOWN_KEY = 'lastApiCall';
-  try {
-    const stored = await window.storage.get(COOLDOWN_KEY);
-    if (stored) {
-      const lastCall = parseInt(stored.value, 10);
-      const elapsed = Date.now() - lastCall;
-      if (elapsed < COOLDOWN_MS) {
-        const remaining = COOLDOWN_MS - elapsed;
-        const hrs = Math.floor(remaining / 3600000);
-        const mins = Math.floor((remaining % 3600000) / 60000);
-        throw new Error("API cooldown active. Next report available in " + hrs + "h " + mins + "m.");
-      }
-    }
-  } catch(e) {
-    if (e.message.includes('cooldown')) throw e;
-    // storage miss or error — allow the call
-  }
-  const prompt = buildReportPrompt(session, sessions);
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-      "anthropic-dangerous-allow-browser": "true"
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 500,
-      system: SYSTEM_PROMPT,
-      messages: [{
-        role: "user",
-        content: prompt
-      }]
-    })
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    if (resp.status === 401) throw new Error("Invalid API key. Check Settings.");
-    if (resp.status === 429) throw new Error("Rate limited. Try again in a minute.");
-    throw new Error(err.error?.message || `API error ${resp.status}`);
-  }
-  const data = await resp.json();
-  // Store timestamp after successful call
-  try { await window.storage.set('lastApiCall', String(Date.now())); } catch(e) {}
-  return data.content[0].text;
-}
-
-// ─── AI TARGET PLANNER ────────────────────────────────────────────────────────
-// Sends athlete context + per-target trend data, expects strict JSON back with
-// recalculated start/target per lift. Fills the Plan form; user reviews + saves.
-const PLAN_SYSTEM = `You are a strength & conditioning planner working on a seasonal calendar. You will receive the athlete background (medical constraints, judo calendar), the CURRENT SEASON (name, purpose, weeks remaining) and the NEXT SEASON, plus per-exercise data (current weight, observed trend per week, direction, unit).
-
-Size every target for the CURRENT season's purpose and the weeks remaining in it:
-- BUILD / REBUILD seasons: progressive targets achievable at the observed rate or slightly below — never heroic. Round DOWN when unsure.
-- MAINTAIN seasons (judo in session): target = current, or current + one increment at most. Holding strength through a judo season IS success; say so in rationales rather than inventing progression.
-- If the season is nearly over (under ~3 weeks), size targets modestly and note they bridge into the next season.
-- Respect the athlete's medical constraints. "down: true" means lower is better (assistance); target <= current, floor 0.
-- start = current weight (re-anchor to today). Round lbs to 2.5; seconds to 5.
-
-Respond with ONLY a JSON object, no markdown fences, no commentary:
-{"season_note":"<one line: how this plan serves this season, max 18 words>","targets":[{"id":"...","start":N,"target":N,"rationale":"<max 12 words>"}]}
-Include every id you were given, in the same order.`;
-async function callPlannerAPI(apiKey, weeksLeft, rows) {
-  const s = seasonAt(), n = nextSeason();
-  const payload = `ATHLETE BACKGROUND:
-${CFG.athleteCtx}
-
-CURRENT SEASON: ${s.name} (${s.purpose}) — ${Math.round(weeksLeft * 10) / 10} weeks remaining
-NEXT SEASON: ${n.name} (${n.purpose})
-
-EXERCISES (current, observed lbs-or-sec per week trend, direction, unit):
-${rows.map(r => `- id=${r.id} "${r.label}": current=${r.current ?? "no data"}, trend/wk=${r.rate ?? "n/a"}, down=${!!r.down}, unit=${r.unit || "lbs"}, previous target=${r.target}`).join("\n")}
-
-Return the JSON now.`;
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-      "anthropic-dangerous-allow-browser": "true"
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 800,
-      system: PLAN_SYSTEM,
-      messages: [{ role: "user", content: payload }]
-    })
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    if (resp.status === 401) throw new Error("Invalid API key. Check Settings.");
-    if (resp.status === 429) throw new Error("Rate limited. Try again in a minute.");
-    throw new Error(err.error?.message || `API error ${resp.status}`);
-  }
-  const data = await resp.json();
-  const text = (data.content || []).map(c => c.text || "").join("");
-  const clean = text.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(clean);
-  if (!parsed || !Array.isArray(parsed.targets)) throw new Error("Planner returned unexpected format.");
-  return parsed; // {season_note, targets}
-}
-
+// ─── THEME ───────────────────────────────────────────────────────────────────
 // ─── THEME ────────────────────────────────────────────────────────────────────
 const C = {
   bg: "#0B0B0D",
@@ -1034,211 +800,9 @@ function Stat({
   }, sub));
 }
 
-// ─── SETTINGS PANEL ───────────────────────────────────────────────────────────
-function SettingsPanel({
-  apiKey,
-  onSave,
-  onClose
-}) {
-  const [draft, setDraft] = useState(apiKey || "");
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState(null);
-  const handleTest = async () => {
-    if (!draft.trim()) {
-      setTestResult({
-        ok: false,
-        msg: "Enter a key first"
-      });
-      return;
-    }
-    setTesting(true);
-    setTestResult(null);
-    try {
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": draft.trim(),
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-          "anthropic-dangerous-allow-browser": "true"
-        },
-        body: JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 10,
-          messages: [{
-            role: "user",
-            content: "Hi"
-          }]
-        })
-      });
-      if (resp.ok) {
-        setTestResult({
-          ok: true,
-          msg: "Key valid ✓"
-        });
-      } else if (resp.status === 401) {
-        setTestResult({
-          ok: false,
-          msg: "Invalid key"
-        });
-      } else {
-        setTestResult({
-          ok: false,
-          msg: `Error ${resp.status}`
-        });
-      }
-    } catch (e) {
-      setTestResult({
-        ok: false,
-        msg: "Network error"
-      });
-    }
-    setTesting(false);
-  };
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: C.card,
-      border: `1px solid ${C.border}`,
-      borderRadius: 12,
-      padding: 20,
-      margin: "0 20px 16px"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center",
-      marginBottom: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: 4,
-      color: C.muted,
-      fontWeight: 700
-    }
-  }, "API SETTINGS"), /*#__PURE__*/React.createElement("button", {
-    onClick: onClose,
-    style: {
-      background: "none",
-      border: "none",
-      color: C.sub,
-      cursor: "pointer",
-      fontSize: 18,
-      padding: 0
-    }
-  }, "\u2715")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      color: C.sub,
-      lineHeight: 1.6,
-      marginBottom: 16
-    }
-  }, "Get your key at ", /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.amber,
-      fontFamily: mono
-    }
-  }, "console.anthropic.com"), " \u2192 API Keys.", /*#__PURE__*/React.createElement("br", null), /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.danger
-    }
-  }, "Set a $5/month spending cap"), " in the Console before using."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginBottom: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: 3,
-      color: C.muted,
-      fontWeight: 700,
-      marginBottom: 6
-    }
-  }, "ANTHROPIC API KEY"), /*#__PURE__*/React.createElement("input", {
-    type: "password",
-    value: draft,
-    onChange: e => setDraft(e.target.value),
-    placeholder: "sk-ant-api03-...",
-    style: {
-      width: "100%",
-      padding: "12px",
-      background: C.surf,
-      border: `1px solid ${C.border}`,
-      borderRadius: 8,
-      color: C.text,
-      fontSize: 14,
-      fontFamily: mono,
-      outline: "none"
-    }
-  })), testResult && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 13,
-      color: testResult.ok ? C.green : C.danger,
-      marginBottom: 12,
-      fontWeight: 700
-    }
-  }, testResult.msg), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: handleTest,
-    disabled: testing,
-    style: {
-      flex: 1,
-      padding: "10px",
-      background: "none",
-      border: `1px solid ${C.border}`,
-      borderRadius: 8,
-      color: C.sub,
-      cursor: "pointer",
-      fontSize: 13,
-      fontWeight: 700,
-      fontFamily: sans,
-      opacity: testing ? 0.5 : 1
-    }
-  }, testing ? "TESTING…" : "TEST KEY"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => onSave(draft.trim()),
-    style: {
-      flex: 2,
-      padding: "10px",
-      background: C.amber,
-      color: "#000",
-      border: "none",
-      borderRadius: 8,
-      cursor: "pointer",
-      fontSize: 13,
-      fontWeight: 800,
-      fontFamily: sans,
-      letterSpacing: 1
-    }
-  }, "SAVE KEY")), apiKey && /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      onSave("");
-      setDraft("");
-    },
-    style: {
-      marginTop: 10,
-      width: "100%",
-      padding: "8px",
-      background: "none",
-      border: "none",
-      color: C.muted,
-      cursor: "pointer",
-      fontSize: 11,
-      fontFamily: sans,
-      letterSpacing: 2
-    }
-  }, "REMOVE KEY"));
-}
-
 // ─── TRAINING CYCLE PLAN (season · targets · weekly schedule) ─────────────────
 function PlanPanel({
   sessions,
-  apiKey,
   onChange
 }) {
   const [tgts, setTgts] = useState(CFG.targets.map(t => ({
@@ -1249,12 +813,7 @@ function PlanPanel({
   const [sched, setSched] = useState({
     ...CFG.sched
   });
-  const [ctx, setCtx] = useState(CFG.athleteCtx);
-  const [showCtx, setShowCtx] = useState(false);
   const [rationales, setRationales] = useState({});
-  const [blockNote, setBlockNote] = useState(null);
-  const [aiBusy, setAiBusy] = useState(false);
-  const [aiErr, setAiErr] = useState(null);
   const [saved, setSaved] = useState(false);
   const CODES = ["A", "B", "J", "R"];
   const CODE_COLOR = {
@@ -1305,40 +864,6 @@ function PlanPanel({
       start: String(lw)
     } : t;
   }));
-  const aiRecalc = async () => {
-    if (!apiKey) {
-      setAiErr("Add your API key above first.");
-      return;
-    }
-    setAiBusy(true);
-    setAiErr(null);
-    try {
-      CFG.athleteCtx = ctx; // use the edited context for this call
-      const rows = tgts.map(t => {
-        const { current, rate } = statRow(t);
-        return { id: t.id, label: t.label, current, rate, down: t.down, unit: t.unit, target: parseFloat(t.target) || t.target };
-      });
-      const plan = await callPlannerAPI(apiKey, weeksLeft(), rows);
-      const out = plan.targets;
-      setBlockNote(plan.season_note || null);
-      const byId = Object.fromEntries(out.map(o => [o.id, o]));
-      const notes = {};
-      setTgts(p => p.map(t => {
-        const o = byId[t.id];
-        if (!o) return t;
-        if (o.rationale) notes[t.id] = o.rationale;
-        return {
-          ...t,
-          start: isFinite(+o.start) ? String(roundU(t, +o.start)) : t.start,
-          target: isFinite(+o.target) ? String(t.down ? Math.max(0, roundU(t, +o.target)) : roundU(t, +o.target)) : t.target
-        };
-      }));
-      setRationales(notes);
-    } catch (e) {
-      setAiErr(e.message);
-    }
-    setAiBusy(false);
-  };
   const cycle = d => setSched(p => ({
     ...p,
     [d]: CODES[(CODES.indexOf(p[d] || "R") + 1) % CODES.length]
@@ -1350,7 +875,6 @@ function PlanPanel({
       target: isFinite(parseFloat(t.target)) ? parseFloat(t.target) : 0
     }));
     CFG.sched = sched;
-    CFG.athleteCtx = ctx;
     saveCfg();
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
@@ -1468,24 +992,10 @@ function PlanPanel({
       color: C.muted,
       fontSize: 12
     }
-  }, "\u2192"), numIn(t.target, v => setT(i, "target", v)))), blockNote && /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.green,
-      fontSize: 12,
-      fontWeight: 700,
-      margin: "4px 0 8px",
-      lineHeight: 1.4
-    }
-  }, "\u26A1 ", blockNote), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 8,
-      marginTop: 2
-    }
-  }, /*#__PURE__*/React.createElement("button", {
+  }, "\u2192"), numIn(t.target, v => setT(i, "target", v)))), /*#__PURE__*/React.createElement("button", {
     onClick: prefillFromTrends,
     style: {
-      flex: 1,
+      width: "100%",
       padding: "9px",
       background: "none",
       border: `1px solid ${C.amber}60`,
@@ -1495,64 +1005,11 @@ function PlanPanel({
       fontSize: 11,
       letterSpacing: 1.5,
       fontWeight: 700,
-      fontFamily: sans
+      fontFamily: sans,
+      marginTop: 2,
+      marginBottom: 8
     }
   }, "\uD83D\uDCC8 PREFILL FROM TRENDS"), /*#__PURE__*/React.createElement("button", {
-    onClick: aiRecalc,
-    disabled: aiBusy,
-    style: {
-      flex: 1,
-      padding: "9px",
-      background: aiBusy ? C.surf : "none",
-      border: `1px solid ${C.green}60`,
-      borderRadius: 8,
-      color: aiBusy ? C.muted : C.green,
-      cursor: aiBusy ? "default" : "pointer",
-      fontSize: 11,
-      letterSpacing: 1.5,
-      fontWeight: 700,
-      fontFamily: sans
-    }
-  }, aiBusy ? "THINKING\u2026" : "\u26A1 AI RECALCULATE")), aiErr && /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.danger,
-      fontSize: 11,
-      marginTop: 6,
-      lineHeight: 1.4
-    }
-  }, aiErr), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setShowCtx(s => !s),
-    style: {
-      background: "none",
-      border: "none",
-      color: C.muted,
-      cursor: "pointer",
-      fontSize: 10,
-      letterSpacing: 2,
-      fontWeight: 700,
-      padding: "10px 0 0",
-      fontFamily: sans
-    }
-  }, showCtx ? "\u25BE ATHLETE CONTEXT (fed to AI)" : "\u25B8 ATHLETE CONTEXT (fed to AI)"), showCtx && /*#__PURE__*/React.createElement("textarea", {
-    value: ctx,
-    onChange: e => setCtx(e.target.value),
-    rows: 7,
-    style: {
-      width: "100%",
-      marginTop: 6,
-      padding: "10px 12px",
-      background: C.surf,
-      border: `1px solid ${C.border}`,
-      borderRadius: 8,
-      color: C.text,
-      fontSize: 12,
-      fontFamily: sans,
-      lineHeight: 1.5,
-      outline: "none",
-      resize: "vertical",
-      boxSizing: "border-box"
-    }
-  }), /*#__PURE__*/React.createElement("button", {
     onClick: useCurrent,
     style: {
       width: "100%",
@@ -1623,161 +1080,6 @@ function PlanPanel({
       letterSpacing: 1.5
     }
   }, saved ? "SAVED \u2713" : "SAVE PLAN"));
-}
-
-// ─── REPORT CARD ──────────────────────────────────────────────────────────────
-function ReportCard({
-  session,
-  sessions,
-  apiKey,
-  onDismiss,
-  onSaveReport
-}) {
-  const [text, setText] = useState(session.report || null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [used, setUsed] = useState(!!session.report);
-  const generate = async () => {
-    if (used || loading || !apiKey) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await callClaudeAPI(apiKey, session, sessions);
-      setText(result);
-      setUsed(true);
-      if (onSaveReport) onSaveReport(session.id, result);
-    } catch (e) {
-      setError(e.message);
-    }
-    setLoading(false);
-  };
-  const w = WORKOUTS[session.wid];
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      margin: "0 20px 16px",
-      background: C.card,
-      border: `1px solid ${C.border}`,
-      borderRadius: 12,
-      overflow: "hidden"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: "12px 16px",
-      borderBottom: `1px solid ${C.border}`,
-      display: "flex",
-      justifyContent: "space-between",
-      alignItems: "center"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: 3,
-      color: C.muted,
-      fontWeight: 700
-    }
-  }, "SESSION REPORT"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 700,
-      fontSize: 16,
-      color: w.color,
-      marginTop: 2
-    }
-  }, w.name, " \xB7 ", fmtFull(displayDate(session)))), /*#__PURE__*/React.createElement("button", {
-    onClick: onDismiss,
-    style: {
-      background: "none",
-      border: "none",
-      color: C.muted,
-      cursor: "pointer",
-      fontSize: 18,
-      padding: "0 0 0 12px"
-    }
-  }, "\u2715")), !text && !loading && !error && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 13,
-      color: C.sub,
-      marginBottom: 14,
-      lineHeight: 1.5
-    }
-  }, "AI-powered post-workout analysis \u2014 performance, progression status, and judo carry-over."), apiKey ? /*#__PURE__*/React.createElement("button", {
-    onClick: generate,
-    style: {
-      width: "100%",
-      padding: "14px",
-      background: w.color,
-      color: "#000",
-      border: "none",
-      borderRadius: 8,
-      fontWeight: 800,
-      fontSize: 16,
-      letterSpacing: 1.5,
-      cursor: "pointer",
-      fontFamily: sans
-    }
-  }, "GENERATE REPORT") : /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.muted,
-      fontSize: 13,
-      textAlign: "center",
-      padding: "8px 0"
-    }
-  }, "Configure API key in \u2699\uFE0F to unlock reports")), loading && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 24,
-      textAlign: "center",
-      color: C.amber,
-      fontSize: 14,
-      fontFamily: mono,
-      letterSpacing: 2
-    }
-  }, "ANALYSING\u2026"), error && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.danger,
-      fontSize: 13,
-      marginBottom: 12
-    }
-  }, error), /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      setError(null);
-      setUsed(false);
-    },
-    style: {
-      fontSize: 12,
-      color: C.sub,
-      background: "none",
-      border: `1px solid ${C.border}`,
-      borderRadius: 6,
-      padding: "6px 12px",
-      cursor: "pointer",
-      fontFamily: sans
-    }
-  }, "TRY AGAIN")), text && /*#__PURE__*/React.createElement("div", {
-    style: {
-      padding: 16
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 14,
-      color: C.text,
-      lineHeight: 1.7,
-      whiteSpace: "pre-wrap"
-    }
-  }, text), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 12,
-      fontSize: 10,
-      color: C.muted,
-      letterSpacing: 2
-    }
-  }, "POWERED BY CLAUDE \xB7 ~$0.001")));
 }
 
 // ─── EXERCISE CARD (session) ───────────────────────────────────────────────────
@@ -2377,13 +1679,10 @@ function HomeView({
   onHistory,
   onExport,
   onImport,
-  onSettings,
-  lastSession,
-  apiKey,
+  onPlan,
   tier,
   onSetTier,
-  onGraduate,
-  onSaveReport
+  onGraduate
 }) {
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long"
@@ -2426,11 +1725,11 @@ function HomeView({
       letterSpacing: -1
     }
   }, today.toUpperCase())), /*#__PURE__*/React.createElement("button", {
-    onClick: onSettings,
+    onClick: onPlan,
     style: {
       background: "none",
       border: `1px solid ${C.border}`,
-      color: apiKey ? C.amber : C.muted,
+      color: C.muted,
       padding: "8px 12px",
       borderRadius: 8,
       cursor: "pointer",
@@ -2469,17 +1768,7 @@ function HomeView({
       color: C.muted,
       fontSize: 12
     }
-  }, sessions.length, " sessions logged", apiKey ? /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: C.amber
-    }
-  }, " \xB7 AI reports ON") : /*#__PURE__*/React.createElement("span", null, " \xB7 AI reports OFF"))), lastSession && /*#__PURE__*/React.createElement(ReportCard, {
-    session: lastSession,
-    sessions: sessions,
-    apiKey: apiKey,
-    onDismiss: () => onStart(null),
-    onSaveReport: onSaveReport
-  }), canGraduate && /*#__PURE__*/React.createElement("div", {
+  }, sessions.length, " sessions logged")), canGraduate && /*#__PURE__*/React.createElement("div", {
     style: {
       margin: "16px 20px 0",
       background: `${C.green}14`,
@@ -2829,43 +2118,6 @@ function HomeView({
   }, "\u2191 IMPORT")));
 }
 
-// ─── SAVED AI REPORT (collapsible, in history) ───────────────────────────────
-function ReportToggle({
-  text
-}) {
-  const [open, setOpen] = useState(false);
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setOpen(o => !o),
-    style: {
-      background: "none",
-      border: "none",
-      color: C.amber,
-      cursor: "pointer",
-      fontSize: 11,
-      letterSpacing: 2,
-      fontWeight: 700,
-      padding: 0,
-      fontFamily: sans
-    }
-  }, open ? "\u25BE AI REPORT" : "\u25B8 AI REPORT"), open && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 8,
-      background: C.surf,
-      border: `1px solid ${C.border}`,
-      borderRadius: 8,
-      padding: "10px 12px",
-      fontSize: 13,
-      color: C.text,
-      lineHeight: 1.6,
-      whiteSpace: "pre-wrap"
-    }
-  }, text));
-}
-
 // ─── HISTORY VIEW ─────────────────────────────────────────────────────────────
 function HistoryView({
   sessions,
@@ -3011,9 +2263,7 @@ function HistoryView({
           marginLeft: 4
         }
       }, "\u2605"));
-    })), s.report && /*#__PURE__*/React.createElement(ReportToggle, {
-      text: s.report
-    }));
+    })));
   })));
 }
 
@@ -3309,9 +2559,7 @@ function GymTracker() {
   const [active, setActive] = useState(null);
   const [progEx, setProgEx] = useState(null);
   const [toast, setToast] = useState("");
-  const [apiKey, setApiKey] = useState(() => LS.get('lobo-gym-key') || "");
-  const [showSettings, setShowSettings] = useState(false);
-  const [lastSession, setLastSession] = useState(null);
+  const [showPlan, setShowPlan] = useState(false);
   const [stale, setStale] = useState(false);
   // Single-instance guard: Android opens a fresh Chrome tab on every launch of
   // the file. Each instance claims a token; when a newer instance claims it,
@@ -3359,24 +2607,23 @@ function GymTracker() {
       try {
       const s = await DB.get("lobo-gym");
       if (Array.isArray(s)) {
-        setSessions(s);
-        IDB.set("lobo-gym", s); // one-time migration localStorage → IndexedDB
+        const clean = s.map(cleanSession);
+        setSessions(clean);
+        DB.set("lobo-gym", clean); // migrate local history and strip legacy AI reports
       }
-      const k = await DB.get("lobo-gym-key");
-      if (k) {
-        setApiKey(k);
-        IDB.set("lobo-gym-key", k);
-      }
+      // v15: local-only. Remove API material left by older versions.
+      DB.del("lobo-gym-key");
+      DB.del("lastApiCall");
       const cfg = await DB.get("lobo-gym-cfg");
       if (cfg && typeof cfg === "object") {
-        if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets;
+        if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets.map(t => ({ ...t }));
         if (cfg.sched && typeof cfg.sched === "object") {
-          CFG.sched = cfg.sched;
+          CFG.sched = { ...cfg.sched };
           // v13→v14 migration: circuit day-code no longer exists
           for (const d in CFG.sched) if (CFG.sched[d] === "C") CFG.sched[d] = "R";
         }
         if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
-        if (typeof cfg.athleteCtx === "string" && cfg.athleteCtx) CFG.athleteCtx = cfg.athleteCtx;
+        saveCfg(); // rewrites legacy config without removed fields
       }
       const t = await DB.get("lobo-gym-tier");
       if (t != null && ['11', '9', '7'].includes(String(t))) {
@@ -3434,24 +2681,7 @@ function GymTracker() {
     bumpCfg();
     flash("Bodyweight pull-ups unlocked \uD83C\uDF93");
   };
-  const saveReport = (sid, txt) => {
-    const ns = sessions.map(s => s.id === sid ? { ...s, report: txt } : s);
-    persist(ns);
-    setLastSession(p => p && p.id === sid ? { ...p, report: txt } : p);
-  };
-  const saveApiKey = key => {
-    setApiKey(key);
-    if (key) DB.set('lobo-gym-key', key);else DB.del('lobo-gym-key');
-    setShowSettings(false);
-    flash(key ? "API key saved ✓" : "API key removed");
-  };
-
-  // onStart doubles as "dismiss report" when called with null
   const handleStart = (wid) => {
-    if (!wid) {
-      setLastSession(null);
-      return;
-    }
     // Starting before the async boot finishes would prefill every exercise
     // from an EMPTY history (factory defaults, no auto-progression, wrong
     // alternation). Better one flash message than a corrupted session.
@@ -3501,7 +2731,6 @@ function GymTracker() {
     setActive(s);
     LS.set("lobo-gym-active", s);
     setView("session");
-    setLastSession(null);
   };
   const updateNote = txt => setActive(a => a ? { ...a, note: txt } : a); // persisted by the [active] effect
   const updateEntry = (eid, patch) => setActive(p => ({
@@ -3523,7 +2752,6 @@ function GymTracker() {
     persist(ns);
     DB.del("lobo-gym-active");
     setActive(null);
-    setLastSession(completed);
     setView("home");
     doExport(ns, true);
     flash("Saved \u00B7 backup downloaded \uD83D\uDCAA");
@@ -3538,16 +2766,21 @@ function GymTracker() {
       if (!silent) flash("No sessions \u2014 nothing to export");
       return;
     }
-    const blob = new Blob([JSON.stringify({
-      v: 2,
+    const backup = {
+      v: 3,
+      app: "butsukari",
+      appVersion: APP_VERSION,
       exported: new Date().toISOString(),
-      sessions: list
-    }, null, 2)], {
+      sessions: list.map(cleanSession),
+      tier,
+      config: cfgSnapshot()
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
       type: "application/json"
     });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `lobo-gym-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `butsukari-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   };
@@ -3565,27 +2798,47 @@ function GymTracker() {
     r.onload = ev => {
       try {
         const d = JSON.parse(ev.target.result);
-        const arr = d.sessions || d;
-        if (Array.isArray(arr)) {
-          if (arr.length === 0) {
-            flash("File has no sessions \u2014 nothing imported");
-            return;
+        const arr = Array.isArray(d) ? d : d.sessions;
+        if (!Array.isArray(arr)) {
+          flash("Invalid backup file");
+          return;
+        }
+
+        // Merge by id: importing can add history, never erase existing sessions.
+        const byId = new Map(sessions.map(s => [s.id, cleanSession(s)]));
+        let added = 0;
+        arr.forEach(raw => {
+          const s = cleanSession(raw);
+          if (s && s.id != null && s.entries !== undefined && !byId.has(s.id)) {
+            byId.set(s.id, s);
+            added++;
           }
-          // Merge by id — import can only ever ADD sessions, never wipe.
-          const byId = new Map(sessions.map(s => [s.id, s]));
-          let added = 0;
-          arr.forEach(s => {
-            if (s && s.id != null && s.entries !== undefined && !byId.has(s.id)) {
-              byId.set(s.id, s);
-              added++;
-            }
-          });
-          const merged = [...byId.values()].sort((a, b) => new Date(a.date) - new Date(b.date));
-          persist(merged);
-          flash(added > 0 ? `Imported ${added} new session${added > 1 ? "s" : ""} \u2713` : "No new sessions in file");
-        } else flash("Invalid file");
+        });
+        const merged = [...byId.values()].sort((a, b) => new Date(a.date) - new Date(b.date));
+        persist(merged);
+
+        let restoredPlan = false;
+        if (!Array.isArray(d) && d.config && typeof d.config === "object") {
+          const cfg = d.config;
+          if (Array.isArray(cfg.targets) && cfg.targets.length) CFG.targets = cfg.targets.map(t => ({ ...t }));
+          if (cfg.sched && typeof cfg.sched === "object") CFG.sched = { ...cfg.sched };
+          if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
+          saveCfg();
+          bumpCfg();
+          restoredPlan = true;
+        }
+        if (!Array.isArray(d) && ['11', '9', '7'].includes(String(d.tier))) {
+          setTierState(String(d.tier));
+          DB.set("lobo-gym-tier", String(d.tier));
+          restoredPlan = true;
+        }
+
+        const sessionMsg = added > 0
+          ? `Imported ${added} new session${added > 1 ? "s" : ""}`
+          : "No new sessions";
+        flash(restoredPlan ? sessionMsg + " \u00B7 plan restored \u2713" : sessionMsg + " \u2713");
       } catch {
-        flash("Could not read file");
+        flash("Could not read backup file");
       }
     };
     r.readAsText(f);
@@ -3819,17 +3072,12 @@ function GymTracker() {
       display: "none"
     },
     onChange: handleImport
-  }), view === "home" && /*#__PURE__*/React.createElement(React.Fragment, null, showSettings && /*#__PURE__*/React.createElement("div", {
+  }), view === "home" && /*#__PURE__*/React.createElement(React.Fragment, null, showPlan && /*#__PURE__*/React.createElement("div", {
     style: {
       paddingTop: 20
     }
-  }, /*#__PURE__*/React.createElement(SettingsPanel, {
-    apiKey: apiKey,
-    onSave: saveApiKey,
-    onClose: () => setShowSettings(false)
-  }), /*#__PURE__*/React.createElement(PlanPanel, {
+  }, /*#__PURE__*/React.createElement(PlanPanel, {
     sessions: sessions,
-    apiKey: apiKey,
     onChange: bumpCfg
   })), /*#__PURE__*/React.createElement(HomeView, {
     sessions: sessions,
@@ -3837,7 +3085,6 @@ function GymTracker() {
     tier: tier,
     onSetTier: setTier,
     onGraduate: graduate,
-    onSaveReport: saveReport,
     onProgress: ex => {
       setProgEx(ex);
       setView("progress");
@@ -3845,9 +3092,7 @@ function GymTracker() {
     onHistory: () => setView("history"),
     onExport: exportData,
     onImport: () => fileRef.current.click(),
-    onSettings: () => setShowSettings(s => !s),
-    lastSession: lastSession,
-    apiKey: apiKey
+    onPlan: () => setShowPlan(s => !s),
   })), view === "session" && active && /*#__PURE__*/React.createElement(SessionView, {
     session: active,
     sessions: sessions,
@@ -3879,7 +3124,7 @@ function GymTracker() {
     onClick: () => {
       if (t.v === "progress") setProgEx(null);
       setView(t.v);
-      setShowSettings(false);
+      setShowPlan(false);
     },
     style: {
       flex: 1,
