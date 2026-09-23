@@ -1412,7 +1412,11 @@ function getLiveGuidance(entry, smart, ex) {
 
   const anchor = loads[loads.length - 1];
   const mixed = loads.some(w => w !== anchor);
-  const changedFromHistory = smart && smart.currentWeight != null && anchor !== smart.currentWeight;
+  const autoStart = entry.pre && ["ready", "deload", "return-down"].includes(entry.pre.kind);
+  // An automatic KITAE starting recommendation is intentional. A user-edited
+  // load clears entry.pre, so only an actual manual departure becomes RESET.
+  const changedFromHistory = smart && smart.currentWeight != null &&
+    anchor !== smart.currentWeight && !autoStart;
 
   if (mixed || changedFromHistory) return {
     currentWeight: anchor,
