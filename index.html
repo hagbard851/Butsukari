@@ -1413,8 +1413,25 @@ function getLiveGuidance(entry, smart, ex) {
   const anchor = loads[loads.length - 1];
   const mixed = loads.some(w => w !== anchor);
   const autoStart = entry.pre && ["ready", "deload", "return-down"].includes(entry.pre.kind);
-  // An automatic KITAE starting recommendation is intentional. A user-edited
-  // load clears entry.pre, so only an actual manual departure becomes RESET.
+
+  if (autoStart && !mixed && smart && smart.currentWeight != null && anchor !== smart.currentWeight) {
+    const kind = entry.pre.kind;
+    return {
+      currentWeight: anchor,
+      nextWeight: null,
+      status: 'auto-live',
+      label: kind === "deload" ? "DELOAD TODAY" : kind === "return-down" ? "RETURN LOAD" : "NEW LOAD",
+      color: kind === "deload" ? '#E05858' : kind === "return-down" ? '#E8952A' : '#4EC97A',
+      tip: kind === "deload"
+        ? `KITAE applied today's deload to ${anchor} ${ex.unit || "lbs"}. Complete what you can; progression rebuilds from this load.`
+        : kind === "return-down"
+          ? `KITAE applied today's return load: ${anchor} ${ex.unit || "lbs"}. Complete it cleanly before rebuilding progression.`
+          : `KITAE advanced today's working load to ${anchor} ${ex.unit || "lbs"}. Complete the prescription; this becomes the new progression anchor.`
+    };
+  }
+
+  // A user-edited load clears entry.pre, so only an actual manual departure
+  // from the historical anchor becomes RESET.
   const changedFromHistory = smart && smart.currentWeight != null &&
     anchor !== smart.currentWeight && !autoStart;
 
