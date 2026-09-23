@@ -2830,10 +2830,14 @@ function GymTracker() {
     };
   }, []);
   const [tier, setTierState] = useState(() => {
-    const t = LS.get('lobo-gym-tier');
-    if (t && ['11', '9', '7'].includes(String(t))) return String(t);
-    const m = parseInt(LS.get('lobo-gym-mode') || '11', 10); // v13 migration: 6-mode folds into 9
-    return m === 11 ? '11' : '9';
+    const season = seasonAt();
+    const state = LS.get('lobo-gym-tier-state');
+    // Manual tier choices persist within a season only. Crossing a season
+    // boundary returns KITAE to that season's intended training tier.
+    if (state && state.seasonId === season.id && ['11', '9', '7'].includes(String(state.tier))) {
+      return String(state.tier);
+    }
+    return String(season.tier);
   });
   const [loaded, setLoaded] = useState(false);
   const [, setCfgV] = useState(0); // bumped after plan edits so CFG changes re-render
@@ -2862,12 +2866,18 @@ function GymTracker() {
         if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
         saveCfg(); // rewrites legacy config without removed fields
       }
-      const t = await DB.get("lobo-gym-tier");
-      if (t != null && ['11', '9', '7'].includes(String(t))) {
-        setTierState(String(t));
+      const season = seasonAt();
+      const tierState = await DB.get("lobo-gym-tier-state");
+      if (tierState && tierState.seasonId === season.id &&
+          ['11', '9', '7'].includes(String(tierState.tier))) {
+        setTierState(String(tierState.tier));
       } else {
-        const m = await DB.get("lobo-gym-mode"); // v13 migration
-        if (m != null) setTierState(parseInt(m, 10) === 11 ? '11' : '9');
+        // New season (or v15.2 migration): use the season's training intent.
+        // The user can still override it manually for the rest of this season.
+        const seasonTier = String(season.tier);
+        setTierState(seasonTier);
+        DB.set("lobo-gym-tier", seasonTier);
+        DB.set("lobo-gym-tier-state", { tier: seasonTier, seasonId: season.id });
       }
       const a = await DB.get("lobo-gym-active");
       if (a && a.wid && a.entries && WORKOUTS[a.wid]) {
@@ -2892,7 +2902,12 @@ function GymTracker() {
     setToast(msg);
     setTimeout(() => setToast(""), 2600);
   };
-  const setTier = m => { setTierState(m); DB.set('lobo-gym-tier', String(m)); };
+  const setTier = m => {
+    const value = String(m);
+    setTierState(value);
+    DB.set('lobo-gym-tier', value);
+    DB.set('lobo-gym-tier-state', { tier: value, seasonId: seasonAt().id });
+  };
   const [editTarget, setEditTarget] = useState(null); // {sid, eid, name, weight, weight2?, parts?, unit}
   const saveEdit = (sid, eid, weight, weight2) => {
     const val = parseFloat(weight);
@@ -3065,8 +3080,10 @@ function GymTracker() {
           restoredPlan = true;
         }
         if (!Array.isArray(d) && ['11', '9', '7'].includes(String(d.tier))) {
-          setTierState(String(d.tier));
-          DB.set("lobo-gym-tier", String(d.tier));
+          const restoredTier = String(d.tier);
+          setTierState(restoredTier);
+          DB.set("lobo-gym-tier", restoredTier);
+          DB.set("lobo-gym-tier-state", { tier: restoredTier, seasonId: seasonAt().id });
           restoredPlan = true;
         }
 
