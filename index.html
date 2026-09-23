@@ -23,7 +23,7 @@
   useRef,
   useCallback
 } = React;
-const APP_VERSION = "15.2";
+const APP_VERSION = "15.3";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -433,7 +433,8 @@ function getHistory(sessions, id, altId = null, field = "weight") {
       setsCompleted,
       reqSets: e.req || null,
       setLoads,
-      mixedLoad
+      mixedLoad,
+      tier: s.tier != null ? String(s.tier) : null
     });
   }
   return result.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -460,7 +461,60 @@ const roundTo = (n, step = 2.5) => {
   const s = Number(step) > 0 ? Number(step) : 2.5;
   return Math.round(n / s) * s;
 };
-const LAYOFF_DAYS = 21;
+const PROGRESSION_POLICIES = {
+  // A/B are normally each seen about once per week. These thresholds are
+  // therefore expressed relative to exercise exposure, not calendar weekdays.
+  '7': {
+    name: "JUDO · MAINTAIN",
+    cleanRequired: 2,
+    shortGapDays: 10,
+    moderateGapDays: 20,
+    veryLongGapDays: 42,
+    returnFactor: 0.95,
+    veryLongReturnFactor: 0.90,
+    stallWarn: 2,
+    stallDeload: 3,
+    deloadFactor: 0.95
+  },
+  '9': {
+    name: "TRANSITION · REBUILD",
+    cleanRequired: 2,
+    shortGapDays: 10,
+    moderateGapDays: 20,
+    veryLongGapDays: 42,
+    returnFactor: 0.925,
+    veryLongReturnFactor: 0.85,
+    stallWarn: 2,
+    stallDeload: 3,
+    deloadFactor: 0.90
+  },
+  '11': {
+    name: "OFF-SEASON · BUILD",
+    cleanRequired: 1,
+    shortGapDays: 10,
+    moderateGapDays: 17,
+    veryLongGapDays: 35,
+    returnFactor: 0.90,
+    veryLongReturnFactor: 0.85,
+    stallWarn: 2,
+    stallDeload: 3,
+    deloadFactor: 0.90
+  }
+};
+
+const progressionPolicy = tier =>
+  PROGRESSION_POLICIES[String(tier)] || PROGRESSION_POLICIES[seasonAt().tier] || PROGRESSION_POLICIES['9'];
+
+function reducedWorkingLoad(current, factor, prog) {
+  const step = Number(prog?.inc) > 0 ? Number(prog.inc) : 2.5;
+  if (prog?.down) {
+    // Assistance exercises deload by ADDING assistance.
+    const rounded = roundTo(current / factor, step);
+    return Math.max(current + step, rounded);
+  }
+  const rounded = roundTo(current * factor, step);
+  return Math.max(0, Math.min(current - step, rounded));
+}
 const displayDate = s => s.endDate || s.date;
 
 // ─── PROGRESSION ──────────────────────────────────────────────────────────────
@@ -468,8 +522,10 @@ const displayDate = s => s.endDate || s.date;
 // "Completed" means: sets done >= the sets that were REQUIRED that session
 // (stored per-entry as `req` since tiers can lower set counts), falling back
 // to the exercise's default when req is absent (pre-v14 history).
-function smartCore(history, prog, ex, defaultSets, startW) {
+function smartCore(history, prog, ex, defaultSets, startW, currentTier = null) {
   const unitW = ex.trackTime ? "sec" : ex.trackReps ? "reps" : "lbs";
+  const tier = String(currentTier || seasonAt().tier || "9");
+  const policy = progressionPolicy(tier);
   const doneOf = h => h.setsCompleted >= (h.reqSets || defaultSets);
   const cleanDoneOf = h => doneOf(h) && !h.mixedLoad;
 
@@ -479,86 +535,147 @@ function smartCore(history, prog, ex, defaultSets, startW) {
     status: 'initial',
     label: 'START',
     color: '#88847F',
-    tip: 'First session — log your working weight.'
+    policy: policy.name,
+    tip: 'First session — establish a clean working load.'
   };
 
   const last = history[history.length - 1];
   const cw = last.weight;
   const daysSince = Math.max(0, (Date.now() - new Date(last.date).getTime()) / 86400000);
 
+  // Any in-session load change becomes the new anchor. It is never treated as
+  // a clean progression exposure at either the old or new load.
   if (last.mixedLoad) return {
     currentWeight: cw,
     nextWeight: null,
     status: 'reset',
     label: 'RESET',
     color: '#E8952A',
-    tip: `Load changed during the last session. Next session starts from the final performed load: ${cw} ${ex.unit || unitW}.`
+    policy: policy.name,
+    tip: `Load changed during the last session. Re-establish ${cw} ${ex.unit || unitW} cleanly before KITAE advances it.`
   };
 
-  if (daysSince >= LAYOFF_DAYS) return {
+  // Long and very-long gaps produce an actual return load, not merely a note.
+  // Assistance exercises invert the arithmetic: more assistance = easier.
+  if (daysSince > policy.moderateGapDays) {
+    const veryLong = daysSince >= policy.veryLongGapDays;
+    const factor = veryLong ? policy.veryLongReturnFactor : policy.returnFactor;
+    const rw = reducedWorkingLoad(cw, factor, prog);
+    return {
+      currentWeight: cw,
+      nextWeight: rw,
+      status: 'return-down',
+      label: veryLong ? 'LONG RETURN' : 'RETURN',
+      color: '#E8952A',
+      policy: policy.name,
+      gapDays: Math.floor(daysSince),
+      tip: `${Math.floor(daysSince)} days since this exercise. ${policy.name}: restart at ${rw} ${ex.unit || unitW}; the old progression streak is retired.`
+    };
+  }
+
+  // Missing roughly one exposure is not a failure. Repeat the last real load
+  // once, then rebuild progression evidence from there.
+  if (daysSince > policy.shortGapDays) return {
     currentWeight: cw,
     nextWeight: null,
-    status: 'return',
-    label: 'RETURN',
+    status: 'repeat',
+    label: 'REPEAT',
     color: '#E8952A',
-    tip: `${Math.floor(daysSince)} days since this exercise. No automatic increase — re-establish ${cw} ${ex.unit || unitW} or adjust lower if needed.`
+    policy: policy.name,
+    gapDays: Math.floor(daysSince),
+    tip: `${Math.floor(daysSince)} days since this exercise. Repeat ${cw} ${ex.unit || unitW}; no increase is earned across the gap.`
+  };
+
+  // Changing tier changes the training objective. Keep the load anchor but do
+  // not carry progression credit from build season into maintenance or vice versa.
+  if (last.tier && last.tier !== tier) return {
+    currentWeight: cw,
+    nextWeight: null,
+    status: 'tier-shift',
+    label: 'TIER SHIFT',
+    color: '#5AA0E0',
+    policy: policy.name,
+    tip: `Now using ${policy.name}. Repeat ${cw} ${ex.unit || unitW} once in Tier ${tier} before this tier starts making progression decisions.`
   };
 
   const nw = prog.down ? Math.max(0, cw - prog.inc) : cw + prog.inc;
 
-  // Progression evidence must also be recent relative to itself. A clean set
-  // from two months ago cannot combine with today's return session to earn an
-  // increase, and old failed attempts cannot manufacture a plateau.
+  // Only evidence from the same tier and without a meaningful exposure gap can
+  // form a streak or stall. Old seasons and interrupted blocks cannot combine.
   const contiguous = [last];
   for (let i = history.length - 2; i >= 0; i--) {
+    const older = history[i];
     const newer = contiguous[0];
-    const gapDays = (new Date(newer.date).getTime() - new Date(history[i].date).getTime()) / 86400000;
-    if (gapDays >= LAYOFF_DAYS) break;
-    contiguous.unshift(history[i]);
+    const gapDays = (new Date(newer.date).getTime() - new Date(older.date).getTime()) / 86400000;
+    if (gapDays > policy.shortGapDays) break;
+    if ((newer.tier || null) !== (older.tier || null)) break;
+    if (older.tier && older.tier !== tier) break;
+    contiguous.unshift(older);
   }
 
-  const recent = contiguous.slice(-3);
-  const plateau = recent.length >= 3 &&
-    recent.every(h => h.weight === cw) &&
-    recent.every(h => !doneOf(h) && !h.mixedLoad);
-
-  let streak = 0;
+  let cleanStreak = 0;
   for (let i = contiguous.length - 1; i >= 0; i--) {
-    if (contiguous[i].weight === cw && cleanDoneOf(contiguous[i])) streak++;
+    const h = contiguous[i];
+    if (h.weight === cw && cleanDoneOf(h)) cleanStreak++;
     else break;
   }
 
-  if (plateau) {
-    const factor = prog.down ? 1.1 : 0.9;
-    const dw = Math.max(0, roundTo(cw * factor, prog.inc));
+  let failStreak = 0;
+  for (let i = contiguous.length - 1; i >= 0; i--) {
+    const h = contiguous[i];
+    if (h.weight === cw && !doneOf(h) && !h.mixedLoad) failStreak++;
+    else break;
+  }
+
+  if (failStreak >= policy.stallDeload) {
+    const dw = reducedWorkingLoad(cw, policy.deloadFactor, prog);
     return {
       currentWeight: cw,
       nextWeight: dw,
       status: 'deload',
       label: 'DELOAD',
       color: '#E05858',
-      tip: `Same load, genuinely attempted but incomplete × 3 sessions. Deload to ${dw} ${ex.unit || unitW} — recover, then reload.`
+      policy: policy.name,
+      failStreak,
+      tip: `${failStreak} genuine incomplete attempts at ${cw} ${ex.unit || unitW}. ${policy.name}: reset to ${dw}, then rebuild from clean completions.`
     };
   }
 
-  if (cleanDoneOf(last) && streak >= 2) return {
+  if (failStreak >= policy.stallWarn) return {
+    currentWeight: cw,
+    nextWeight: null,
+    status: 'stall',
+    label: 'STALL',
+    color: '#E8952A',
+    policy: policy.name,
+    failStreak,
+    tip: `${failStreak} incomplete attempts at the same load. Hold ${cw} ${ex.unit || unitW} once more; KITAE will deload only if the stall persists.`
+  };
+
+  if (cleanDoneOf(last) && cleanStreak >= policy.cleanRequired) return {
     currentWeight: cw,
     nextWeight: nw,
     status: 'ready',
     label: prog.down ? 'READY ↓' : 'READY ↑',
     color: '#4EC97A',
-    streak,
-    tip: `${streak} consecutive clean completions — ${prog.down ? `reduce assist by ${prog.inc} lbs` : `add ${prog.inc} ${unitW}`} next session.`
+    policy: policy.name,
+    streak: cleanStreak,
+    tip: `${cleanStreak} clean completion${cleanStreak === 1 ? "" : "s"} at ${cw}. ${policy.name} requires ${policy.cleanRequired}; next is ${nw} ${ex.unit || unitW}.`
   };
 
-  if (cleanDoneOf(last) && streak === 1) return {
-    currentWeight: cw,
-    nextWeight: nw,
-    status: '1of2',
-    label: '1 OF 2',
-    color: '#E8952A',
-    tip: `All prescribed sets completed once at ${cw} ${ex.unit || unitW}. Repeat it once more before progressing to ${nw}.`
-  };
+  if (cleanDoneOf(last)) {
+    const remaining = Math.max(0, policy.cleanRequired - cleanStreak);
+    return {
+      currentWeight: cw,
+      nextWeight: nw,
+      status: 'building',
+      label: `${cleanStreak} OF ${policy.cleanRequired}`,
+      color: '#E8952A',
+      policy: policy.name,
+      streak: cleanStreak,
+      tip: `${policy.name}: ${remaining} more clean completion${remaining === 1 ? "" : "s"} at ${cw} ${ex.unit || unitW} before progressing to ${nw}.`
+    };
+  }
 
   return {
     currentWeight: cw,
@@ -566,22 +683,23 @@ function smartCore(history, prog, ex, defaultSets, startW) {
     status: 'hold',
     label: 'HOLD',
     color: '#88847F',
-    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} sets completed. Hit all prescribed sets before progressing.`
+    policy: policy.name,
+    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} prescribed sets completed. Hold the working load until the prescription is clean.`
   };
 }
-function getSmartNext(sessions, ex) {
+
+function getSmartNext(sessions, ex, currentTier = null) {
   if (ex.bw || ex.w === null || ex.parts) return null;
   const prog = PROG[ex.id];
   if (!prog) return null;
   const history = getHistory(sessions, ex.id, ex.alt);
-  return smartCore(history, prog, ex, ex.sets, ex.w);
+  return smartCore(history, prog, ex, ex.sets, ex.w, currentTier);
 }
-// Row-style parts: each part has its own field, increment and history stream.
-// Note: part completion uses the WHOLE exercise's set count (all 4 row sets),
-// since a single sets counter covers both parts.
-function getSmartNextPart(sessions, ex, part) {
+
+// Row-style parts use the same adaptive engine and tier policy.
+function getSmartNextPart(sessions, ex, part, currentTier = null) {
   const history = getHistory(sessions, ex.id, part.alt, part.field);
-  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w);
+  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w, currentTier);
 }
 function getStats(sessions, id, target = null, down = false, altId = null) {
   const hist = getHistory(sessions, id, altId);
@@ -1164,6 +1282,7 @@ function RowParts({
   ex,
   entry,
   sessions,
+  tier,
   onUpdate
 }) {
   return /*#__PURE__*/React.createElement("div", {
@@ -1173,7 +1292,7 @@ function RowParts({
   }, ex.parts.map((p, pi) => {
     const preKey = pi === 0 ? "pre" : "pre2";
     const pre = entry[preKey];
-    const smart = getSmartNextPart(sessions, ex, p);
+    const smart = getSmartNextPart(sessions, ex, p, tier);
     const val = entry[p.field] ?? p.w ?? "";
     return /*#__PURE__*/React.createElement("div", {
       key: p.field,
@@ -1239,9 +1358,9 @@ function RowParts({
         fontSize: 8,
         letterSpacing: 1.5,
         fontWeight: 800,
-        color: pre.kind === "deload" ? C.danger : C.green
+        color: pre.kind === "deload" ? C.danger : pre.kind === "return-down" ? C.amber : C.green
       }
-    }, pre.kind === "deload" ? "DELOAD \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("button", {
+    }, pre.kind === "deload" ? "DELOAD \u2193" : pre.kind === "return-down" ? "RETURN \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("button", {
       onClick: () => onUpdate({
         [p.field]: pre.from,
         [preKey]: null
@@ -1293,7 +1412,28 @@ function getLiveGuidance(entry, smart, ex) {
 
   const anchor = loads[loads.length - 1];
   const mixed = loads.some(w => w !== anchor);
-  const changedFromHistory = smart && smart.currentWeight != null && anchor !== smart.currentWeight;
+  const autoStart = entry.pre && ["ready", "deload", "return-down"].includes(entry.pre.kind);
+
+  if (autoStart && !mixed && smart && smart.currentWeight != null && anchor !== smart.currentWeight) {
+    const kind = entry.pre.kind;
+    return {
+      currentWeight: anchor,
+      nextWeight: null,
+      status: 'auto-live',
+      label: kind === "deload" ? "DELOAD TODAY" : kind === "return-down" ? "RETURN LOAD" : "NEW LOAD",
+      color: kind === "deload" ? '#E05858' : kind === "return-down" ? '#E8952A' : '#4EC97A',
+      tip: kind === "deload"
+        ? `KITAE applied today's deload to ${anchor} ${ex.unit || "lbs"}. Complete what you can; progression rebuilds from this load.`
+        : kind === "return-down"
+          ? `KITAE applied today's return load: ${anchor} ${ex.unit || "lbs"}. Complete it cleanly before rebuilding progression.`
+          : `KITAE advanced today's working load to ${anchor} ${ex.unit || "lbs"}. Complete the prescription; this becomes the new progression anchor.`
+    };
+  }
+
+  // A user-edited load clears entry.pre, so only an actual manual departure
+  // from the historical anchor becomes RESET.
+  const changedFromHistory = smart && smart.currentWeight != null &&
+    anchor !== smart.currentWeight && !autoStart;
 
   if (mixed || changedFromHistory) return {
     currentWeight: anchor,
@@ -1310,6 +1450,7 @@ function ExCard({
   ex,
   entry,
   sessions,
+  tier,
   color,
   onUpdate
 }) {
@@ -1317,7 +1458,7 @@ function ExCard({
   const setsCompleted = entry.sets || 0;
   const isDone = !!entry.done;
   const [showTip, setShowTip] = useState(false);
-  const historicalSmart = getSmartNext(sessions, ex);
+  const historicalSmart = getSmartNext(sessions, ex, tier);
   const smart = getLiveGuidance(entry, historicalSmart, ex);
   const toggleSet = i => {
     const n = i < setsCompleted ? i : i + 1;
@@ -1438,6 +1579,7 @@ function ExCard({
     ex: ex,
     entry: entry,
     sessions: sessions,
+    tier: tier,
     onUpdate: onUpdate
   }), !isBW && ex.w !== null && !ex.parts && /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1496,9 +1638,9 @@ function ExCard({
       fontSize: 9,
       letterSpacing: 2,
       fontWeight: 800,
-      color: entry.pre.kind === "deload" ? C.danger : C.green
+      color: entry.pre.kind === "deload" ? C.danger : entry.pre.kind === "return-down" ? C.amber : C.green
     }
-  }, entry.pre.kind === "deload" ? "DELOAD \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("div", {
+  }, entry.pre.kind === "deload" ? "DELOAD \u2193" : entry.pre.kind === "return-down" ? "RETURN \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: C.muted,
@@ -1713,6 +1855,7 @@ function SessionView({
     ex: ex,
     entry: session.entries[ex.id] || {},
     sessions: sessions,
+    tier: session.tier || seasonAt().tier,
     color: w.color,
     onUpdate: p => onUpdate(ex.id, p)
   }))), /*#__PURE__*/React.createElement("div", {
@@ -2381,7 +2524,8 @@ function HistoryView({
 // ─── PROGRESS VIEW ────────────────────────────────────────────────────────────
 function ProgressView({
   sessions,
-  initEx
+  initEx,
+  tier
 }) {
   // Show one chip per movement: paired A/B exercises (alt) collapse into the
   // first occurrence, and retired legacy ids (cable-row) never get their own chip.
@@ -2410,7 +2554,7 @@ function ProgressView({
     weight: h.weight
   })) : [];
   const stats = getStats(sessions, selId, tgt?.target, tgt?.down, altId);
-  const smart = ex ? getSmartNext(sessions, ex) : null;
+  const smart = ex ? getSmartNext(sessions, ex, tier) : null;
   const prVal = chartData.length ? tgt?.down ? Math.min(...chartData.map(d => d.weight)) : Math.max(...chartData.map(d => d.weight)) : null;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2439,7 +2583,7 @@ function ProgressView({
       overflowX: "auto"
     }
   }, trackable.map(e => {
-    const s = getSmartNext(sessions, e);
+    const s = getSmartNext(sessions, e, tier);
     const dot = s?.status === 'ready' ? C.green : s?.status === 'deload' ? C.danger : null;
     return /*#__PURE__*/React.createElement("button", {
       key: e.id,
@@ -2597,7 +2741,7 @@ function ProgressView({
       fontWeight: 800,
       color: smart.color
     }
-  }, smart.status === "1of2" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
+  }, smart.status === "building" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       color: C.sub
@@ -2704,10 +2848,14 @@ function GymTracker() {
     };
   }, []);
   const [tier, setTierState] = useState(() => {
-    const t = LS.get('lobo-gym-tier');
-    if (t && ['11', '9', '7'].includes(String(t))) return String(t);
-    const m = parseInt(LS.get('lobo-gym-mode') || '11', 10); // v13 migration: 6-mode folds into 9
-    return m === 11 ? '11' : '9';
+    const season = seasonAt();
+    const state = LS.get('lobo-gym-tier-state');
+    // Manual tier choices persist within a season only. Crossing a season
+    // boundary returns KITAE to that season's intended training tier.
+    if (state && state.seasonId === season.id && ['11', '9', '7'].includes(String(state.tier))) {
+      return String(state.tier);
+    }
+    return String(season.tier);
   });
   const [loaded, setLoaded] = useState(false);
   const [, setCfgV] = useState(0); // bumped after plan edits so CFG changes re-render
@@ -2736,12 +2884,18 @@ function GymTracker() {
         if (typeof cfg.pullupsBW === "boolean") CFG.pullupsBW = cfg.pullupsBW;
         saveCfg(); // rewrites legacy config without removed fields
       }
-      const t = await DB.get("lobo-gym-tier");
-      if (t != null && ['11', '9', '7'].includes(String(t))) {
-        setTierState(String(t));
+      const season = seasonAt();
+      const tierState = await DB.get("lobo-gym-tier-state");
+      if (tierState && tierState.seasonId === season.id &&
+          ['11', '9', '7'].includes(String(tierState.tier))) {
+        setTierState(String(tierState.tier));
       } else {
-        const m = await DB.get("lobo-gym-mode"); // v13 migration
-        if (m != null) setTierState(parseInt(m, 10) === 11 ? '11' : '9');
+        // New season (or v15.2 migration): use the season's training intent.
+        // The user can still override it manually for the rest of this season.
+        const seasonTier = String(season.tier);
+        setTierState(seasonTier);
+        DB.set("lobo-gym-tier", seasonTier);
+        DB.set("lobo-gym-tier-state", { tier: seasonTier, seasonId: season.id });
       }
       const a = await DB.get("lobo-gym-active");
       if (a && a.wid && a.entries && WORKOUTS[a.wid]) {
@@ -2766,7 +2920,12 @@ function GymTracker() {
     setToast(msg);
     setTimeout(() => setToast(""), 2600);
   };
-  const setTier = m => { setTierState(m); DB.set('lobo-gym-tier', String(m)); };
+  const setTier = m => {
+    const value = String(m);
+    setTierState(value);
+    DB.set('lobo-gym-tier', value);
+    DB.set('lobo-gym-tier-state', { tier: value, seasonId: seasonAt().id });
+  };
   const [editTarget, setEditTarget] = useState(null); // {sid, eid, name, weight, weight2?, parts?, unit}
   const saveEdit = (sid, eid, weight, weight2) => {
     const val = parseFloat(weight);
@@ -2809,8 +2968,8 @@ function GymTracker() {
         const e = { sets: 0, done: false, req: ex.sets };
         ex.parts.forEach((p, pi) => {
           const lastW = getLastW(sessions, ex.id, p.alt, p.field) ?? p.w ?? "";
-          const smart = getSmartNextPart(sessions, ex, p);
-          const auto = smart && smart.nextWeight != null && (smart.status === "ready" || smart.status === "deload");
+          const smart = getSmartNextPart(sessions, ex, p, isAB ? tier : seasonAt().tier);
+          const auto = smart && smart.nextWeight != null && ["ready", "deload", "return-down"].includes(smart.status);
           e[p.field] = auto ? smart.nextWeight : lastW;
           e[pi === 0 ? "pre" : "pre2"] = auto ? { from: smart.currentWeight, kind: smart.status } : null;
         });
@@ -2818,8 +2977,8 @@ function GymTracker() {
         return;
       }
       const lastW = getLastW(sessions, ex.id, ex.alt) ?? ex.w ?? "";
-      const smart = getSmartNext(sessions, ex);
-      const auto = smart && smart.nextWeight != null && (smart.status === "ready" || smart.status === "deload");
+      const smart = getSmartNext(sessions, ex, isAB ? tier : seasonAt().tier);
+      const auto = smart && smart.nextWeight != null && ["ready", "deload", "return-down"].includes(smart.status);
       entries[ex.id] = {
         weight: auto ? smart.nextWeight : lastW,
         sets: 0,
@@ -2939,8 +3098,10 @@ function GymTracker() {
           restoredPlan = true;
         }
         if (!Array.isArray(d) && ['11', '9', '7'].includes(String(d.tier))) {
-          setTierState(String(d.tier));
-          DB.set("lobo-gym-tier", String(d.tier));
+          const restoredTier = String(d.tier);
+          setTierState(restoredTier);
+          DB.set("lobo-gym-tier", restoredTier);
+          DB.set("lobo-gym-tier-state", { tier: restoredTier, seasonId: seasonAt().id });
           restoredPlan = true;
         }
 
@@ -3216,7 +3377,8 @@ function GymTracker() {
     onChipEdit: t => setEditTarget(t)
   }), view === "progress" && /*#__PURE__*/React.createElement(ProgressView, {
     sessions: sessions,
-    initEx: progEx
+    initEx: progEx,
+    tier: tier
   }), view !== "session" && /*#__PURE__*/React.createElement("nav", {
     style: {
       position: "fixed",
