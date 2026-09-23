@@ -2507,7 +2507,8 @@ function HistoryView({
 // ─── PROGRESS VIEW ────────────────────────────────────────────────────────────
 function ProgressView({
   sessions,
-  initEx
+  initEx,
+  tier
 }) {
   // Show one chip per movement: paired A/B exercises (alt) collapse into the
   // first occurrence, and retired legacy ids (cable-row) never get their own chip.
@@ -2536,7 +2537,7 @@ function ProgressView({
     weight: h.weight
   })) : [];
   const stats = getStats(sessions, selId, tgt?.target, tgt?.down, altId);
-  const smart = ex ? getSmartNext(sessions, ex) : null;
+  const smart = ex ? getSmartNext(sessions, ex, tier) : null;
   const prVal = chartData.length ? tgt?.down ? Math.min(...chartData.map(d => d.weight)) : Math.max(...chartData.map(d => d.weight)) : null;
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2565,7 +2566,7 @@ function ProgressView({
       overflowX: "auto"
     }
   }, trackable.map(e => {
-    const s = getSmartNext(sessions, e);
+    const s = getSmartNext(sessions, e, tier);
     const dot = s?.status === 'ready' ? C.green : s?.status === 'deload' ? C.danger : null;
     return /*#__PURE__*/React.createElement("button", {
       key: e.id,
@@ -2723,7 +2724,7 @@ function ProgressView({
       fontWeight: 800,
       color: smart.color
     }
-  }, smart.status === "1of2" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
+  }, smart.status === "building" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       color: C.sub
@@ -3359,7 +3360,8 @@ function GymTracker() {
     onChipEdit: t => setEditTarget(t)
   }), view === "progress" && /*#__PURE__*/React.createElement(ProgressView, {
     sessions: sessions,
-    initEx: progEx
+    initEx: progEx,
+    tier: tier
   }), view !== "session" && /*#__PURE__*/React.createElement("nav", {
     style: {
       position: "fixed",
