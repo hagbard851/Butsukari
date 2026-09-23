@@ -1621,9 +1621,9 @@ function ExCard({
       fontSize: 9,
       letterSpacing: 2,
       fontWeight: 800,
-      color: entry.pre.kind === "deload" ? C.danger : C.green
+      color: entry.pre.kind === "deload" ? C.danger : entry.pre.kind === "return-down" ? C.amber : C.green
     }
-  }, entry.pre.kind === "deload" ? "DELOAD \u2193" : pre.kind === "return-down" ? "RETURN \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("div", {
+  }, entry.pre.kind === "deload" ? "DELOAD \u2193" : entry.pre.kind === "return-down" ? "RETURN \u2193" : "AUTO \u2191"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: C.muted,
