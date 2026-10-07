@@ -23,7 +23,7 @@
   useRef,
   useCallback
 } = React;
-const APP_VERSION = "15.3";
+const APP_VERSION = "15.4";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -1931,6 +1931,7 @@ function HomeView({
   onStart,
   onProgress,
   onHistory,
+  onShare,
   onExport,
   onImport,
   onPlan,
@@ -2340,25 +2341,40 @@ function HomeView({
       gap: 10
     }
   }, /*#__PURE__*/React.createElement("button", {
+    onClick: onShare,
+    style: {
+      flex: 1.2,
+      padding: "11px 6px",
+      background: "none",
+      border: `1px solid ${C.amber}60`,
+      borderRadius: 8,
+      color: C.amber,
+      cursor: "pointer",
+      fontSize: 11,
+      letterSpacing: 1.1,
+      fontWeight: 800,
+      fontFamily: sans
+    }
+  }, "\u2193 SHARE HISTORY"), /*#__PURE__*/React.createElement("button", {
     onClick: onExport,
     style: {
-      flex: 1,
-      padding: "11px",
+      flex: 0.9,
+      padding: "11px 6px",
       background: "none",
       border: `1px solid ${C.border}`,
       borderRadius: 8,
       color: C.sub,
       cursor: "pointer",
-      fontSize: 12,
-      letterSpacing: 1.5,
+      fontSize: 11,
+      letterSpacing: 1.1,
       fontWeight: 700,
       fontFamily: sans
     }
-  }, "\u2193 EXPORT"), /*#__PURE__*/React.createElement("button", {
+  }, "BACKUP"), /*#__PURE__*/React.createElement("button", {
     onClick: onImport,
     style: {
-      flex: 1,
-      padding: "11px",
+      flex: 0.9,
+      padding: "11px 6px",
       background: "none",
       border: `1px solid ${C.border}`,
       borderRadius: 8,
@@ -3023,14 +3039,72 @@ function GymTracker() {
     DB.del("lobo-gym-active");
     setActive(null);
     setView("home");
-    doExport(ns, true);
-    flash("Saved \u00B7 backup downloaded \uD83D\uDCAA");
+    doShareHistory(ns, true);
+    flash("Saved \u00B7 share history downloaded \uD83D\uDCAA");
   };
   const cancelSession = () => {
     DB.del("lobo-gym-active");
     setActive(null);
     setView("home");
   };
+  const compactShareSession = s => {
+    const out = {
+      id: s.id,
+      date: s.date,
+      endDate: s.endDate,
+      wid: s.wid,
+      tier: s.tier ?? null
+    };
+    if (s.note) out.note = s.note;
+
+    const entries = {};
+    for (const [eid, e] of Object.entries(s.entries || {})) {
+      if (!e || typeof e !== "object") continue;
+      const x = {};
+      if (e.weight !== undefined && e.weight !== "") x.weight = e.weight;
+      if (e.weight2 !== undefined && e.weight2 !== "") x.weight2 = e.weight2;
+      if (e.sets !== undefined) x.sets = e.sets;
+      if (e.req !== undefined && e.req !== null) x.req = e.req;
+      if (Array.isArray(e.setLoads) && e.setLoads.length) x.setLoads = e.setLoads;
+      if (Object.keys(x).length) entries[eid] = x;
+    }
+    out.entries = entries;
+    return out;
+  };
+
+  const doShareHistory = (list, silent = false) => {
+    if (!list || list.length === 0) {
+      if (!silent) flash("No sessions \u2014 nothing to share");
+      return;
+    }
+
+    // Analysis/share export: workout evidence only. Intentionally excludes
+    // app config, targets, schedule, UI state, prefill metadata and done flags.
+    const share = {
+      format: "butsukari-training-history",
+      appVersion: APP_VERSION,
+      exported: new Date().toISOString(),
+      sessions: list.map(compactShareSession)
+    };
+    const blob = new Blob([JSON.stringify(share)], {
+      type: "application/json"
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `butsukari-history-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    if (!silent) flash(`Share file \u00B7 ${list.length} workouts`);
+  };
+
+  const shareHistory = () => {
+    if (!loaded) {
+      flash("Still loading \u2014 try again in a second");
+      return;
+    }
+    doShareHistory(sessions);
+  };
+
   const doExport = (list, silent = false) => {
     if (!list || list.length === 0) {
       if (!silent) flash("No sessions \u2014 nothing to export");
@@ -3362,6 +3436,7 @@ function GymTracker() {
       setView("progress");
     },
     onHistory: () => setView("history"),
+    onShare: shareHistory,
     onExport: exportData,
     onImport: () => fileRef.current.click(),
     onPlan: () => setShowPlan(s => !s),
