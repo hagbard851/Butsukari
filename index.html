@@ -3142,6 +3142,10 @@ function GymTracker() {
     r.onload = ev => {
       try {
         const d = JSON.parse(ev.target.result);
+        if (!Array.isArray(d) && d?.format === "butsukari-training-history") {
+          flash("Share history is not a backup · use a BACKUP file");
+          return;
+        }
         const arr = Array.isArray(d) ? d : d.sessions;
         if (!Array.isArray(arr)) {
           flash("Invalid backup file");
