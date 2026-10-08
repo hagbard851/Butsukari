@@ -23,7 +23,7 @@
   useRef,
   useCallback
 } = React;
-const APP_VERSION = "15.4";
+const APP_VERSION = "15.5";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -153,10 +153,10 @@ const SEP_TARGETS = [{
 // two short gym seasons (spring rebuild, summer build). No dates in the UI —
 // boundaries exist only so the pacing math has something to divide by.
 const SEASONS = [
-  { id: "winter", name: "WINTER", kanji: "\u51AC", startMonth: 0, purpose: "JUDO SEASON \u00B7 MAINTAIN", mode: "maintain", tier: "7",  color: "#5AA0E0" },
-  { id: "spring", name: "SPRING", kanji: "\u6625", startMonth: 4, purpose: "TRANSITION \u00B7 REBUILD",   mode: "build",    tier: "9",  color: "#7BC96F" },
-  { id: "summer", name: "SUMMER", kanji: "\u590F", startMonth: 6, purpose: "OFF-SEASON \u00B7 BUILD",     mode: "build",    tier: "11", color: "#E8952A" },
-  { id: "fall",   name: "FALL",   kanji: "\u79CB", startMonth: 8, purpose: "JUDO SEASON \u00B7 MAINTAIN", mode: "maintain", tier: "7",  color: "#C96A4A" }
+  { id: "winter", name: "WINTER", kanji: "\u51AC", startMonth: 0, purpose: "JUDO SEASON \u00B7 MAINTAIN", phase: "maintain", tier: "7",  color: "#5AA0E0" },
+  { id: "spring", name: "SPRING", kanji: "\u6625", startMonth: 4, purpose: "TRANSITION \u00B7 REBUILD",   phase: "rebuild",  tier: "9",  color: "#7BC96F" },
+  { id: "summer", name: "SUMMER", kanji: "\u590F", startMonth: 6, purpose: "OFF-SEASON \u00B7 BUILD",     phase: "build",    tier: "11", color: "#E8952A" },
+  { id: "fall",   name: "FALL",   kanji: "\u79CB", startMonth: 8, purpose: "JUDO SEASON \u00B7 MAINTAIN", phase: "maintain", tier: "7",  color: "#C96A4A" }
 ];
 function seasonAt(d = new Date()) {
   const m = d.getMonth();
@@ -427,14 +427,19 @@ function getHistory(sessions, id, altId = null, field = "weight") {
     }
 
     if (!Number.isFinite(weight)) continue;
+    const when = s.endDate || s.date;
+    const histSeason = seasonAt(new Date(when));
+    const legacyTier = s.mode === 11 ? "11" : (s.mode === 9 || s.mode === 6 ? "9" : null);
     result.push({
-      date: s.endDate || s.date,
+      date: when,
       weight,
       setsCompleted,
       reqSets: e.req || null,
       setLoads,
       mixedLoad,
-      tier: s.tier != null ? String(s.tier) : null
+      tier: s.tier != null ? String(s.tier) : legacyTier,
+      seasonId: histSeason.id,
+      phase: histSeason.phase
     });
   }
   return result.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -461,10 +466,8 @@ const roundTo = (n, step = 2.5) => {
   const s = Number(step) > 0 ? Number(step) : 2.5;
   return Math.round(n / s) * s;
 };
-const PROGRESSION_POLICIES = {
-  // A/B are normally each seen about once per week. These thresholds are
-  // therefore expressed relative to exercise exposure, not calendar weekdays.
-  '7': {
+const PHASE_POLICIES = {
+  maintain: {
     name: "JUDO · MAINTAIN",
     cleanRequired: 2,
     shortGapDays: 10,
@@ -476,7 +479,7 @@ const PROGRESSION_POLICIES = {
     stallDeload: 3,
     deloadFactor: 0.95
   },
-  '9': {
+  rebuild: {
     name: "TRANSITION · REBUILD",
     cleanRequired: 2,
     shortGapDays: 10,
@@ -488,7 +491,7 @@ const PROGRESSION_POLICIES = {
     stallDeload: 3,
     deloadFactor: 0.90
   },
-  '11': {
+  build: {
     name: "OFF-SEASON · BUILD",
     cleanRequired: 1,
     shortGapDays: 10,
@@ -502,8 +505,32 @@ const PROGRESSION_POLICIES = {
   }
 };
 
-const progressionPolicy = tier =>
-  PROGRESSION_POLICIES[String(tier)] || PROGRESSION_POLICIES[seasonAt().tier] || PROGRESSION_POLICIES['9'];
+const TIER_POLICY = {
+  '7':  { minCleanRequired: 2 },
+  '9':  { minCleanRequired: 2 },
+  '11': { minCleanRequired: 1 }
+};
+
+function progressionContext(tier = null, d = new Date()) {
+  const season = seasonAt(d);
+  const selectedTier = String(tier || season.tier || "9");
+  const phase = PHASE_POLICIES[season.phase] || PHASE_POLICIES.rebuild;
+  const tmod = TIER_POLICY[selectedTier] || TIER_POLICY['9'];
+  return {
+    ...phase,
+    phase: season.phase,
+    seasonId: season.id,
+    seasonName: season.name,
+    tier: selectedTier,
+    cleanRequired: Math.max(phase.cleanRequired, tmod.minCleanRequired),
+    label: `${phase.name} · TIER ${selectedTier}`
+  };
+}
+
+function requiredSetsForTier(ex, tier) {
+  const t = String(tier || seasonAt().tier || "9");
+  return Number(TIER_SETS[t]?.[ex.id] ?? ex.sets ?? 0);
+}
 
 function reducedWorkingLoad(current, factor, prog) {
   const step = Number(prog?.inc) > 0 ? Number(prog.inc) : 2.5;
@@ -522,236 +549,144 @@ const displayDate = s => s.endDate || s.date;
 // "Completed" means: sets done >= the sets that were REQUIRED that session
 // (stored per-entry as `req` since tiers can lower set counts), falling back
 // to the exercise's default when req is absent (pre-v14 history).
-function smartCore(history, prog, ex, defaultSets, startW, currentTier = null) {
+function smartCore(history, prog, ex, defaultSets, startW, currentTier = null, currentDate = new Date()) {
   const unitW = ex.trackTime ? "sec" : ex.trackReps ? "reps" : "lbs";
-  const tier = String(currentTier || seasonAt().tier || "9");
-  const policy = progressionPolicy(tier);
-  const doneOf = h => h.setsCompleted >= (h.reqSets || defaultSets);
-  const cleanDoneOf = h => doneOf(h) && !h.mixedLoad;
+  const ctx = progressionContext(currentTier, currentDate);
+  const tier = ctx.tier;
+  const currentReq = requiredSetsForTier(ex, tier) || defaultSets;
+  const cleanForCurrent = h => h.setsCompleted >= currentReq && !h.mixedLoad;
+  const failedAttempt = h => h.setsCompleted < (h.reqSets || currentReq) && !h.mixedLoad;
+  const historicallyComplete = h => h.setsCompleted >= (h.reqSets || defaultSets);
 
   if (history.length === 0) return {
-    currentWeight: startW,
-    nextWeight: null,
-    status: 'initial',
-    label: 'START',
-    color: '#88847F',
-    policy: policy.name,
-    tip: 'First session — establish a clean working load.'
+    currentWeight: startW, nextWeight: null, status: 'initial', label: 'START',
+    color: '#88847F', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `First session in ${ctx.label.toLowerCase()} — establish a clean working load.`
   };
 
   const last = history[history.length - 1];
   const cw = last.weight;
-  const daysSince = Math.max(0, (Date.now() - new Date(last.date).getTime()) / 86400000);
+  const daysSince = Math.max(0, (currentDate.getTime() - new Date(last.date).getTime()) / 86400000);
 
-  // Any in-session load change becomes the new anchor. It is never treated as
-  // a clean progression exposure at either the old or new load.
   if (last.mixedLoad) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'reset',
-    label: 'RESET',
-    color: '#E8952A',
-    policy: policy.name,
+    currentWeight: cw, nextWeight: null, status: 'reset', label: 'RESET',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier,
     tip: `Load changed during the last session. Re-establish ${cw} ${ex.unit || unitW} cleanly before KITAE advances it.`
   };
 
-  // Long and very-long gaps produce an actual return load, not merely a note.
-  // Assistance exercises invert the arithmetic: more assistance = easier.
-  if (daysSince > policy.moderateGapDays) {
-    const veryLong = daysSince >= policy.veryLongGapDays;
-    const factor = veryLong ? policy.veryLongReturnFactor : policy.returnFactor;
+  if (daysSince > ctx.moderateGapDays) {
+    const veryLong = daysSince >= ctx.veryLongGapDays;
+    const factor = veryLong ? ctx.veryLongReturnFactor : ctx.returnFactor;
     const rw = reducedWorkingLoad(cw, factor, prog);
     return {
-      currentWeight: cw,
-      nextWeight: rw,
-      status: 'return-down',
-      label: veryLong ? 'LONG RETURN' : 'RETURN',
-      color: '#E8952A',
-      policy: policy.name,
-      gapDays: Math.floor(daysSince),
-      tip: `${Math.floor(daysSince)} days since this exercise. ${policy.name}: restart at ${rw} ${ex.unit || unitW}; the old progression streak is retired.`
+      currentWeight: cw, nextWeight: rw, status: 'return-down',
+      label: veryLong ? 'LONG RETURN' : 'RETURN', color: '#E8952A',
+      policy: ctx.label, phase: ctx.phase, tier, gapDays: Math.floor(daysSince),
+      tip: `${Math.floor(daysSince)} days since this exercise. ${ctx.label}: restart at ${rw} ${ex.unit || unitW}; old progression credit is retired.`
     };
   }
 
-  // Missing roughly one exposure is not a failure. Repeat the last real load
-  // once, then rebuild progression evidence from there.
-  if (daysSince > policy.shortGapDays) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'repeat',
-    label: 'REPEAT',
-    color: '#E8952A',
-    policy: policy.name,
+  if (daysSince > ctx.shortGapDays) return {
+    currentWeight: cw, nextWeight: null, status: 'repeat', label: 'REPEAT',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier,
     gapDays: Math.floor(daysSince),
     tip: `${Math.floor(daysSince)} days since this exercise. Repeat ${cw} ${ex.unit || unitW}; no increase is earned across the gap.`
   };
 
-  // Changing tier changes the training objective. Keep the load anchor but do
-  // not carry progression credit from build season into maintenance or vice versa.
-  if (last.tier && last.tier !== tier) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'tier-shift',
-    label: 'TIER SHIFT',
-    color: '#5AA0E0',
-    policy: policy.name,
-    tip: `Now using ${policy.name}. Repeat ${cw} ${ex.unit || unitW} once in Tier ${tier} before this tier starts making progression decisions.`
+  if (last.phase && last.phase !== ctx.phase) return {
+    currentWeight: cw, nextWeight: null, status: 'season-shift', label: 'SEASON SHIFT',
+    color: '#5AA0E0', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `Training objective changed to ${ctx.label}. Repeat ${cw} ${ex.unit || unitW} once before building new progression credit.`
+  };
+
+  if (historicallyComplete(last) && !cleanForCurrent(last)) return {
+    currentWeight: cw, nextWeight: null, status: 'tier-build', label: `TIER ${tier}`,
+    color: '#5AA0E0', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `Last exposure completed ${last.setsCompleted} sets at ${cw}. Tier ${tier} asks ${currentReq}; establish that prescription cleanly before progressing.`
   };
 
   const nw = prog.down ? Math.max(0, cw - prog.inc) : cw + prog.inc;
-
-  // Only evidence from the same tier and without a meaningful exposure gap can
-  // form a streak or stall. Old seasons and interrupted blocks cannot combine.
   const contiguous = [last];
   for (let i = history.length - 2; i >= 0; i--) {
-    const older = history[i];
-    const newer = contiguous[0];
+    const older = history[i], newer = contiguous[0];
     const gapDays = (new Date(newer.date).getTime() - new Date(older.date).getTime()) / 86400000;
-    if (gapDays > policy.shortGapDays) break;
-    if ((newer.tier || null) !== (older.tier || null)) break;
-    if (older.tier && older.tier !== tier) break;
+    if (gapDays > ctx.shortGapDays) break;
+    if (older.phase && older.phase !== ctx.phase) break;
     contiguous.unshift(older);
   }
 
   let cleanStreak = 0;
   for (let i = contiguous.length - 1; i >= 0; i--) {
     const h = contiguous[i];
-    if (h.weight === cw && cleanDoneOf(h)) cleanStreak++;
+    if (h.weight === cw && cleanForCurrent(h)) cleanStreak++;
     else break;
   }
 
   let failStreak = 0;
   for (let i = contiguous.length - 1; i >= 0; i--) {
     const h = contiguous[i];
-    if (h.weight === cw && !doneOf(h) && !h.mixedLoad) failStreak++;
+    if (h.weight === cw && failedAttempt(h) && !cleanForCurrent(h)) failStreak++;
     else break;
   }
 
-  if (failStreak >= policy.stallDeload) {
-    const dw = reducedWorkingLoad(cw, policy.deloadFactor, prog);
+  if (failStreak >= ctx.stallDeload) {
+    const dw = reducedWorkingLoad(cw, ctx.deloadFactor, prog);
     return {
-      currentWeight: cw,
-      nextWeight: dw,
-      status: 'deload',
-      label: 'DELOAD',
-      color: '#E05858',
-      policy: policy.name,
-      failStreak,
-      tip: `${failStreak} genuine incomplete attempts at ${cw} ${ex.unit || unitW}. ${policy.name}: reset to ${dw}, then rebuild from clean completions.`
+      currentWeight: cw, nextWeight: dw, status: 'deload', label: 'DELOAD',
+      color: '#E05858', policy: ctx.label, phase: ctx.phase, tier, failStreak,
+      tip: `${failStreak} genuine incomplete attempts at ${cw} ${ex.unit || unitW}. ${ctx.label}: reset to ${dw}, then rebuild from clean completions.`
     };
   }
 
-  if (failStreak >= policy.stallWarn) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'stall',
-    label: 'STALL',
-    color: '#E8952A',
-    policy: policy.name,
-    failStreak,
-    tip: `${failStreak} incomplete attempts at the same load. Hold ${cw} ${ex.unit || unitW} once more; KITAE will deload only if the stall persists.`
+  if (failStreak >= ctx.stallWarn) return {
+    currentWeight: cw, nextWeight: null, status: 'stall', label: 'STALL',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier, failStreak,
+    tip: `${failStreak} incomplete attempts at the same prescription. Hold ${cw} ${ex.unit || unitW}; KITAE deloads only if the stall persists.`
   };
 
-  if (cleanDoneOf(last) && cleanStreak >= policy.cleanRequired) return {
-    currentWeight: cw,
-    nextWeight: nw,
-    status: 'ready',
-    label: prog.down ? 'READY ↓' : 'READY ↑',
-    color: '#4EC97A',
-    policy: policy.name,
-    streak: cleanStreak,
-    tip: `${cleanStreak} clean completion${cleanStreak === 1 ? "" : "s"} at ${cw}. ${policy.name} requires ${policy.cleanRequired}; next is ${nw} ${ex.unit || unitW}.`
+  if (cleanForCurrent(last) && cleanStreak >= ctx.cleanRequired) return {
+    currentWeight: cw, nextWeight: nw, status: 'ready',
+    label: prog.down ? 'READY ↓' : 'READY ↑', color: '#4EC97A',
+    policy: ctx.label, phase: ctx.phase, tier, streak: cleanStreak,
+    tip: `${cleanStreak} clean completion${cleanStreak === 1 ? "" : "s"} at ${cw}. ${ctx.label} requires ${ctx.cleanRequired}; next is ${nw} ${ex.unit || unitW}.`
   };
 
-  if (cleanDoneOf(last)) {
-    const remaining = Math.max(0, policy.cleanRequired - cleanStreak);
+  if (cleanForCurrent(last)) {
+    const remaining = Math.max(0, ctx.cleanRequired - cleanStreak);
     return {
-      currentWeight: cw,
-      nextWeight: nw,
-      status: 'building',
-      label: `${cleanStreak} OF ${policy.cleanRequired}`,
-      color: '#E8952A',
-      policy: policy.name,
-      streak: cleanStreak,
-      tip: `${policy.name}: ${remaining} more clean completion${remaining === 1 ? "" : "s"} at ${cw} ${ex.unit || unitW} before progressing to ${nw}.`
+      currentWeight: cw, nextWeight: nw, status: 'building',
+      label: `${cleanStreak} OF ${ctx.cleanRequired}`, color: '#E8952A',
+      policy: ctx.label, phase: ctx.phase, tier, streak: cleanStreak,
+      tip: `${ctx.label}: ${remaining} more clean completion${remaining === 1 ? "" : "s"} at ${cw} ${ex.unit || unitW} before progressing to ${nw}.`
     };
   }
 
   return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'hold',
-    label: 'HOLD',
-    color: '#88847F',
-    policy: policy.name,
-    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} prescribed sets completed. Hold the working load until the prescription is clean.`
+    currentWeight: cw, nextWeight: null, status: 'hold', label: 'HOLD',
+    color: '#88847F', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `${last.setsCompleted}/${currentReq} sets toward the current Tier ${tier} prescription. Hold the working load until it is clean.`
   };
 }
 
-function getSmartNext(sessions, ex, currentTier = null) {
+function getSmartNext(sessions, ex, currentTier = null, currentDate = new Date()) {
   if (ex.bw || ex.w === null || ex.parts) return null;
   const prog = PROG[ex.id];
   if (!prog) return null;
   const history = getHistory(sessions, ex.id, ex.alt);
-  return smartCore(history, prog, ex, ex.sets, ex.w, currentTier);
+  return smartCore(history, prog, ex, ex.sets, ex.w, currentTier, currentDate);
 }
 
-// Row-style parts use the same adaptive engine and tier policy.
-function getSmartNextPart(sessions, ex, part, currentTier = null) {
+function getSmartNextPart(sessions, ex, part, currentTier = null, currentDate = new Date()) {
   const history = getHistory(sessions, ex.id, part.alt, part.field);
-  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w, currentTier);
+  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w, currentTier, currentDate);
 }
 function getStats(sessions, id, target = null, down = false, altId = null) {
   const hist = getHistory(sessions, id, altId);
   if (hist.length === 0) return null;
   const current = hist[hist.length - 1].weight;
   const pr = down ? Math.min(...hist.map(h => h.weight)) : Math.max(...hist.map(h => h.weight));
-  const isPR = current === pr;
-  if (hist.length < 2) return {
-    current,
-    pr,
-    isPR,
-    ratePerWeek: null
-  };
-  const sample = hist.slice(-8);
-  const n = sample.length;
-  const t0 = new Date(sample[0].date).getTime();
-  const xs = sample.map(h => (new Date(h.date).getTime() - t0) / (86400000 * 7));
-  const ys = sample.map(h => h.weight);
-  const sx = xs.reduce((a, b) => a + b, 0),
-    sy = ys.reduce((a, b) => a + b, 0);
-  const sxx = xs.reduce((a, b) => a + b * b, 0),
-    sxy = xs.reduce((a, v, i) => a + v * ys[i], 0);
-  const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx || 1);
-  let projection = null;
-  if (target != null && slope !== 0) {
-    const weeksToSep = (cfgDeadline() - new Date()) / (86400000 * 7);
-    if (weeksToSep <= 0) {
-      // Season boundary has passed — no pace math, just flag the cycle as ended.
-      return { current, pr, isPR, ratePerWeek: Math.round(slope * 10) / 10, projection: { expired: true } };
-    }
-    const remaining = down ? current - target : target - current;
-    const effectiveSlope = down ? -slope : slope;
-    if (effectiveSlope > 0) {
-      const weeksNeeded = remaining / effectiveSlope;
-      projection = {
-        weeksNeeded: Math.round(weeksNeeded),
-        onTrack: weeksNeeded <= weeksToSep,
-        weeksOff: Math.round(Math.abs(weeksToSep - weeksNeeded))
-      };
-    } else {
-      projection = {
-        stalled: true
-      };
-    }
-  }
-  return {
-    current,
-    pr,
-    isPR,
-    ratePerWeek: Math.round(slope * 10) / 10,
-    projection
-  };
+  const previous = hist.length > 1 ? hist[hist.length - 2].weight : null;
+  return { current, pr, isPR: current === pr, attempts: hist.length, previous, lastDate: hist[hist.length - 1].date };
 }
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
@@ -2866,8 +2801,8 @@ function GymTracker() {
   const [tier, setTierState] = useState(() => {
     const season = seasonAt();
     const state = LS.get('lobo-gym-tier-state');
-    // Manual tier choices persist within a season only. Crossing a season
-    // boundary returns KITAE to that season's intended training tier.
+    // Tier is a session-volume choice, not the season identity. A Tier 9 day
+    // in fall is still JUDO · MAINTAIN. Crossing seasons resets only the default.
     if (state && state.seasonId === season.id && ['11', '9', '7'].includes(String(state.tier))) {
       return String(state.tier);
     }
@@ -2906,8 +2841,8 @@ function GymTracker() {
           ['11', '9', '7'].includes(String(tierState.tier))) {
         setTierState(String(tierState.tier));
       } else {
-        // New season (or v15.2 migration): use the season's training intent.
-        // The user can still override it manually for the rest of this season.
+        // New season: start from its suggested tier. The user can still choose
+        // Tier 7/9/11 on any day without changing the training phase.
         const seasonTier = String(season.tier);
         setTierState(seasonTier);
         DB.set("lobo-gym-tier", seasonTier);
