@@ -1053,7 +1053,14 @@ function PlanPanel({
       fontFamily: sans,
       marginTop: 2
     }
-  }, "USE CURRENT WEIGHTS AS START"), secLabel("WEEKLY SCHEDULE \xB7 TAP TO CYCLE"), /*#__PURE__*/React.createElement("div", {
+  }, "USE CURRENT WEIGHTS AS START"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.muted,
+      fontSize: 10,
+      lineHeight: 1.5,
+      marginTop: 8
+    }
+  }, "Targets are reference goals only. Next loads, returns, stalls and deloads come from the adaptive season + session-tier engine."), secLabel("WEEKLY SCHEDULE \xB7 TAP TO CYCLE"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 5
@@ -2555,7 +2562,7 @@ function ProgressView({
   }, part2.label.toUpperCase(), " \u2014 GAP TO TWO-HAND = IMBALANCE"), /*#__PURE__*/React.createElement(SvgChart, {
     data: chartData2,
     color: C.blue
-  })), smart && smart.nextWeight != null && smart.status !== 'initial' && /*#__PURE__*/React.createElement("div", {
+  })), smart && smart.status !== 'initial' && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 16,
       background: C.surf,
@@ -2571,7 +2578,7 @@ function ProgressView({
       fontWeight: 700,
       marginBottom: 4
     }
-  }, "NEXT SESSION TARGET"), /*#__PURE__*/React.createElement("div", {
+  }, "ADAPTIVE NEXT LOAD"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -2590,7 +2597,7 @@ function ProgressView({
       fontWeight: 800,
       color: smart.color
     }
-  }, smart.status === "building" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
+  }, smart.status === "building" || smart.nextWeight == null ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       color: C.sub
