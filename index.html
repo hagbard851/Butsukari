@@ -23,7 +23,7 @@
   useRef,
   useCallback
 } = React;
-const APP_VERSION = "15.4";
+const APP_VERSION = "15.5";
 
 // ─── DATA ─────────────────────────────────────────────────────────────────────
 const WORKOUTS = {
@@ -153,10 +153,10 @@ const SEP_TARGETS = [{
 // two short gym seasons (spring rebuild, summer build). No dates in the UI —
 // boundaries exist only so the pacing math has something to divide by.
 const SEASONS = [
-  { id: "winter", name: "WINTER", kanji: "\u51AC", startMonth: 0, purpose: "JUDO SEASON \u00B7 MAINTAIN", mode: "maintain", tier: "7",  color: "#5AA0E0" },
-  { id: "spring", name: "SPRING", kanji: "\u6625", startMonth: 4, purpose: "TRANSITION \u00B7 REBUILD",   mode: "build",    tier: "9",  color: "#7BC96F" },
-  { id: "summer", name: "SUMMER", kanji: "\u590F", startMonth: 6, purpose: "OFF-SEASON \u00B7 BUILD",     mode: "build",    tier: "11", color: "#E8952A" },
-  { id: "fall",   name: "FALL",   kanji: "\u79CB", startMonth: 8, purpose: "JUDO SEASON \u00B7 MAINTAIN", mode: "maintain", tier: "7",  color: "#C96A4A" }
+  { id: "winter", name: "WINTER", kanji: "\u51AC", startMonth: 0, purpose: "JUDO SEASON \u00B7 MAINTAIN", phase: "maintain", tier: "7",  color: "#5AA0E0" },
+  { id: "spring", name: "SPRING", kanji: "\u6625", startMonth: 4, purpose: "TRANSITION \u00B7 REBUILD",   phase: "rebuild",  tier: "9",  color: "#7BC96F" },
+  { id: "summer", name: "SUMMER", kanji: "\u590F", startMonth: 6, purpose: "OFF-SEASON \u00B7 BUILD",     phase: "build",    tier: "11", color: "#E8952A" },
+  { id: "fall",   name: "FALL",   kanji: "\u79CB", startMonth: 8, purpose: "JUDO SEASON \u00B7 MAINTAIN", phase: "maintain", tier: "7",  color: "#C96A4A" }
 ];
 function seasonAt(d = new Date()) {
   const m = d.getMonth();
@@ -184,7 +184,6 @@ const CFG = {
   sched: { 0: "R", 1: "J", 2: "B", 3: "R", 4: "J", 5: "A", 6: "R" },
   pullupsBW: false
 };
-const cfgDeadline = () => seasonEnd(); // pacing horizon = end of the current season
 const cfgLabel = () => "END OF " + seasonAt().name;
 const ALL_EX = [...WORKOUTS.A.exercises, ...WORKOUTS.B.exercises, ...WORKOUTS.T.exercises, ...WORKOUTS.P.exercises, ...LEGACY_EX].filter((e, i, a) => a.findIndex(x => x.id === e.id) === i);
 const EX_BY_ID = Object.fromEntries(ALL_EX.map(e => [e.id, e]));
@@ -427,14 +426,19 @@ function getHistory(sessions, id, altId = null, field = "weight") {
     }
 
     if (!Number.isFinite(weight)) continue;
+    const when = s.endDate || s.date;
+    const histSeason = seasonAt(new Date(when));
+    const legacyTier = s.mode === 11 ? "11" : (s.mode === 9 || s.mode === 6 ? "9" : null);
     result.push({
-      date: s.endDate || s.date,
+      date: when,
       weight,
       setsCompleted,
       reqSets: e.req || null,
       setLoads,
       mixedLoad,
-      tier: s.tier != null ? String(s.tier) : null
+      tier: s.tier != null ? String(s.tier) : legacyTier,
+      seasonId: histSeason.id,
+      phase: histSeason.phase
     });
   }
   return result.sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -461,10 +465,8 @@ const roundTo = (n, step = 2.5) => {
   const s = Number(step) > 0 ? Number(step) : 2.5;
   return Math.round(n / s) * s;
 };
-const PROGRESSION_POLICIES = {
-  // A/B are normally each seen about once per week. These thresholds are
-  // therefore expressed relative to exercise exposure, not calendar weekdays.
-  '7': {
+const PHASE_POLICIES = {
+  maintain: {
     name: "JUDO · MAINTAIN",
     cleanRequired: 2,
     shortGapDays: 10,
@@ -476,7 +478,7 @@ const PROGRESSION_POLICIES = {
     stallDeload: 3,
     deloadFactor: 0.95
   },
-  '9': {
+  rebuild: {
     name: "TRANSITION · REBUILD",
     cleanRequired: 2,
     shortGapDays: 10,
@@ -488,7 +490,7 @@ const PROGRESSION_POLICIES = {
     stallDeload: 3,
     deloadFactor: 0.90
   },
-  '11': {
+  build: {
     name: "OFF-SEASON · BUILD",
     cleanRequired: 1,
     shortGapDays: 10,
@@ -502,8 +504,32 @@ const PROGRESSION_POLICIES = {
   }
 };
 
-const progressionPolicy = tier =>
-  PROGRESSION_POLICIES[String(tier)] || PROGRESSION_POLICIES[seasonAt().tier] || PROGRESSION_POLICIES['9'];
+const TIER_POLICY = {
+  '7':  { minCleanRequired: 2 },
+  '9':  { minCleanRequired: 2 },
+  '11': { minCleanRequired: 1 }
+};
+
+function progressionContext(tier = null, d = new Date()) {
+  const season = seasonAt(d);
+  const selectedTier = String(tier || season.tier || "9");
+  const phase = PHASE_POLICIES[season.phase] || PHASE_POLICIES.rebuild;
+  const tmod = TIER_POLICY[selectedTier] || TIER_POLICY['9'];
+  return {
+    ...phase,
+    phase: season.phase,
+    seasonId: season.id,
+    seasonName: season.name,
+    tier: selectedTier,
+    cleanRequired: Math.max(phase.cleanRequired, tmod.minCleanRequired),
+    label: `${phase.name} · TIER ${selectedTier}`
+  };
+}
+
+function requiredSetsForTier(ex, tier) {
+  const t = String(tier || seasonAt().tier || "9");
+  return Number(TIER_SETS[t]?.[ex.id] ?? ex.sets ?? 0);
+}
 
 function reducedWorkingLoad(current, factor, prog) {
   const step = Number(prog?.inc) > 0 ? Number(prog.inc) : 2.5;
@@ -522,236 +548,144 @@ const displayDate = s => s.endDate || s.date;
 // "Completed" means: sets done >= the sets that were REQUIRED that session
 // (stored per-entry as `req` since tiers can lower set counts), falling back
 // to the exercise's default when req is absent (pre-v14 history).
-function smartCore(history, prog, ex, defaultSets, startW, currentTier = null) {
+function smartCore(history, prog, ex, defaultSets, startW, currentTier = null, currentDate = new Date()) {
   const unitW = ex.trackTime ? "sec" : ex.trackReps ? "reps" : "lbs";
-  const tier = String(currentTier || seasonAt().tier || "9");
-  const policy = progressionPolicy(tier);
-  const doneOf = h => h.setsCompleted >= (h.reqSets || defaultSets);
-  const cleanDoneOf = h => doneOf(h) && !h.mixedLoad;
+  const ctx = progressionContext(currentTier, currentDate);
+  const tier = ctx.tier;
+  const currentReq = requiredSetsForTier(ex, tier) || defaultSets;
+  const cleanForCurrent = h => h.setsCompleted >= currentReq && !h.mixedLoad;
+  const failedAttempt = h => h.setsCompleted < (h.reqSets || currentReq) && !h.mixedLoad;
+  const historicallyComplete = h => h.setsCompleted >= (h.reqSets || defaultSets);
 
   if (history.length === 0) return {
-    currentWeight: startW,
-    nextWeight: null,
-    status: 'initial',
-    label: 'START',
-    color: '#88847F',
-    policy: policy.name,
-    tip: 'First session — establish a clean working load.'
+    currentWeight: startW, nextWeight: null, status: 'initial', label: 'START',
+    color: '#88847F', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `First session in ${ctx.label.toLowerCase()} — establish a clean working load.`
   };
 
   const last = history[history.length - 1];
   const cw = last.weight;
-  const daysSince = Math.max(0, (Date.now() - new Date(last.date).getTime()) / 86400000);
+  const daysSince = Math.max(0, (currentDate.getTime() - new Date(last.date).getTime()) / 86400000);
 
-  // Any in-session load change becomes the new anchor. It is never treated as
-  // a clean progression exposure at either the old or new load.
   if (last.mixedLoad) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'reset',
-    label: 'RESET',
-    color: '#E8952A',
-    policy: policy.name,
+    currentWeight: cw, nextWeight: null, status: 'reset', label: 'RESET',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier,
     tip: `Load changed during the last session. Re-establish ${cw} ${ex.unit || unitW} cleanly before KITAE advances it.`
   };
 
-  // Long and very-long gaps produce an actual return load, not merely a note.
-  // Assistance exercises invert the arithmetic: more assistance = easier.
-  if (daysSince > policy.moderateGapDays) {
-    const veryLong = daysSince >= policy.veryLongGapDays;
-    const factor = veryLong ? policy.veryLongReturnFactor : policy.returnFactor;
+  if (daysSince > ctx.moderateGapDays) {
+    const veryLong = daysSince >= ctx.veryLongGapDays;
+    const factor = veryLong ? ctx.veryLongReturnFactor : ctx.returnFactor;
     const rw = reducedWorkingLoad(cw, factor, prog);
     return {
-      currentWeight: cw,
-      nextWeight: rw,
-      status: 'return-down',
-      label: veryLong ? 'LONG RETURN' : 'RETURN',
-      color: '#E8952A',
-      policy: policy.name,
-      gapDays: Math.floor(daysSince),
-      tip: `${Math.floor(daysSince)} days since this exercise. ${policy.name}: restart at ${rw} ${ex.unit || unitW}; the old progression streak is retired.`
+      currentWeight: cw, nextWeight: rw, status: 'return-down',
+      label: veryLong ? 'LONG RETURN' : 'RETURN', color: '#E8952A',
+      policy: ctx.label, phase: ctx.phase, tier, gapDays: Math.floor(daysSince),
+      tip: `${Math.floor(daysSince)} days since this exercise. ${ctx.label}: restart at ${rw} ${ex.unit || unitW}; old progression credit is retired.`
     };
   }
 
-  // Missing roughly one exposure is not a failure. Repeat the last real load
-  // once, then rebuild progression evidence from there.
-  if (daysSince > policy.shortGapDays) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'repeat',
-    label: 'REPEAT',
-    color: '#E8952A',
-    policy: policy.name,
+  if (daysSince > ctx.shortGapDays) return {
+    currentWeight: cw, nextWeight: null, status: 'repeat', label: 'REPEAT',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier,
     gapDays: Math.floor(daysSince),
     tip: `${Math.floor(daysSince)} days since this exercise. Repeat ${cw} ${ex.unit || unitW}; no increase is earned across the gap.`
   };
 
-  // Changing tier changes the training objective. Keep the load anchor but do
-  // not carry progression credit from build season into maintenance or vice versa.
-  if (last.tier && last.tier !== tier) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'tier-shift',
-    label: 'TIER SHIFT',
-    color: '#5AA0E0',
-    policy: policy.name,
-    tip: `Now using ${policy.name}. Repeat ${cw} ${ex.unit || unitW} once in Tier ${tier} before this tier starts making progression decisions.`
+  if (last.phase && last.phase !== ctx.phase) return {
+    currentWeight: cw, nextWeight: null, status: 'season-shift', label: 'SEASON SHIFT',
+    color: '#5AA0E0', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `Training objective changed to ${ctx.label}. Repeat ${cw} ${ex.unit || unitW} once before building new progression credit.`
+  };
+
+  if (historicallyComplete(last) && !cleanForCurrent(last)) return {
+    currentWeight: cw, nextWeight: null, status: 'tier-build', label: `TIER ${tier}`,
+    color: '#5AA0E0', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `Last exposure completed ${last.setsCompleted} sets at ${cw}. Tier ${tier} asks ${currentReq}; establish that prescription cleanly before progressing.`
   };
 
   const nw = prog.down ? Math.max(0, cw - prog.inc) : cw + prog.inc;
-
-  // Only evidence from the same tier and without a meaningful exposure gap can
-  // form a streak or stall. Old seasons and interrupted blocks cannot combine.
   const contiguous = [last];
   for (let i = history.length - 2; i >= 0; i--) {
-    const older = history[i];
-    const newer = contiguous[0];
+    const older = history[i], newer = contiguous[0];
     const gapDays = (new Date(newer.date).getTime() - new Date(older.date).getTime()) / 86400000;
-    if (gapDays > policy.shortGapDays) break;
-    if ((newer.tier || null) !== (older.tier || null)) break;
-    if (older.tier && older.tier !== tier) break;
+    if (gapDays > ctx.shortGapDays) break;
+    if (older.phase && older.phase !== ctx.phase) break;
     contiguous.unshift(older);
   }
 
   let cleanStreak = 0;
   for (let i = contiguous.length - 1; i >= 0; i--) {
     const h = contiguous[i];
-    if (h.weight === cw && cleanDoneOf(h)) cleanStreak++;
+    if (h.weight === cw && cleanForCurrent(h)) cleanStreak++;
     else break;
   }
 
   let failStreak = 0;
   for (let i = contiguous.length - 1; i >= 0; i--) {
     const h = contiguous[i];
-    if (h.weight === cw && !doneOf(h) && !h.mixedLoad) failStreak++;
+    if (h.weight === cw && failedAttempt(h) && !cleanForCurrent(h)) failStreak++;
     else break;
   }
 
-  if (failStreak >= policy.stallDeload) {
-    const dw = reducedWorkingLoad(cw, policy.deloadFactor, prog);
+  if (failStreak >= ctx.stallDeload) {
+    const dw = reducedWorkingLoad(cw, ctx.deloadFactor, prog);
     return {
-      currentWeight: cw,
-      nextWeight: dw,
-      status: 'deload',
-      label: 'DELOAD',
-      color: '#E05858',
-      policy: policy.name,
-      failStreak,
-      tip: `${failStreak} genuine incomplete attempts at ${cw} ${ex.unit || unitW}. ${policy.name}: reset to ${dw}, then rebuild from clean completions.`
+      currentWeight: cw, nextWeight: dw, status: 'deload', label: 'DELOAD',
+      color: '#E05858', policy: ctx.label, phase: ctx.phase, tier, failStreak,
+      tip: `${failStreak} genuine incomplete attempts at ${cw} ${ex.unit || unitW}. ${ctx.label}: reset to ${dw}, then rebuild from clean completions.`
     };
   }
 
-  if (failStreak >= policy.stallWarn) return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'stall',
-    label: 'STALL',
-    color: '#E8952A',
-    policy: policy.name,
-    failStreak,
-    tip: `${failStreak} incomplete attempts at the same load. Hold ${cw} ${ex.unit || unitW} once more; KITAE will deload only if the stall persists.`
+  if (failStreak >= ctx.stallWarn) return {
+    currentWeight: cw, nextWeight: null, status: 'stall', label: 'STALL',
+    color: '#E8952A', policy: ctx.label, phase: ctx.phase, tier, failStreak,
+    tip: `${failStreak} incomplete attempts at the same prescription. Hold ${cw} ${ex.unit || unitW}; KITAE deloads only if the stall persists.`
   };
 
-  if (cleanDoneOf(last) && cleanStreak >= policy.cleanRequired) return {
-    currentWeight: cw,
-    nextWeight: nw,
-    status: 'ready',
-    label: prog.down ? 'READY ↓' : 'READY ↑',
-    color: '#4EC97A',
-    policy: policy.name,
-    streak: cleanStreak,
-    tip: `${cleanStreak} clean completion${cleanStreak === 1 ? "" : "s"} at ${cw}. ${policy.name} requires ${policy.cleanRequired}; next is ${nw} ${ex.unit || unitW}.`
+  if (cleanForCurrent(last) && cleanStreak >= ctx.cleanRequired) return {
+    currentWeight: cw, nextWeight: nw, status: 'ready',
+    label: prog.down ? 'READY ↓' : 'READY ↑', color: '#4EC97A',
+    policy: ctx.label, phase: ctx.phase, tier, streak: cleanStreak,
+    tip: `${cleanStreak} clean completion${cleanStreak === 1 ? "" : "s"} at ${cw}. ${ctx.label} requires ${ctx.cleanRequired}; next is ${nw} ${ex.unit || unitW}.`
   };
 
-  if (cleanDoneOf(last)) {
-    const remaining = Math.max(0, policy.cleanRequired - cleanStreak);
+  if (cleanForCurrent(last)) {
+    const remaining = Math.max(0, ctx.cleanRequired - cleanStreak);
     return {
-      currentWeight: cw,
-      nextWeight: nw,
-      status: 'building',
-      label: `${cleanStreak} OF ${policy.cleanRequired}`,
-      color: '#E8952A',
-      policy: policy.name,
-      streak: cleanStreak,
-      tip: `${policy.name}: ${remaining} more clean completion${remaining === 1 ? "" : "s"} at ${cw} ${ex.unit || unitW} before progressing to ${nw}.`
+      currentWeight: cw, nextWeight: nw, status: 'building',
+      label: `${cleanStreak} OF ${ctx.cleanRequired}`, color: '#E8952A',
+      policy: ctx.label, phase: ctx.phase, tier, streak: cleanStreak,
+      tip: `${ctx.label}: ${remaining} more clean completion${remaining === 1 ? "" : "s"} at ${cw} ${ex.unit || unitW} before progressing to ${nw}.`
     };
   }
 
   return {
-    currentWeight: cw,
-    nextWeight: null,
-    status: 'hold',
-    label: 'HOLD',
-    color: '#88847F',
-    policy: policy.name,
-    tip: `${last.setsCompleted}/${last.reqSets || defaultSets} prescribed sets completed. Hold the working load until the prescription is clean.`
+    currentWeight: cw, nextWeight: null, status: 'hold', label: 'HOLD',
+    color: '#88847F', policy: ctx.label, phase: ctx.phase, tier,
+    tip: `${last.setsCompleted}/${currentReq} sets toward the current Tier ${tier} prescription. Hold the working load until it is clean.`
   };
 }
 
-function getSmartNext(sessions, ex, currentTier = null) {
+function getSmartNext(sessions, ex, currentTier = null, currentDate = new Date()) {
   if (ex.bw || ex.w === null || ex.parts) return null;
   const prog = PROG[ex.id];
   if (!prog) return null;
   const history = getHistory(sessions, ex.id, ex.alt);
-  return smartCore(history, prog, ex, ex.sets, ex.w, currentTier);
+  return smartCore(history, prog, ex, ex.sets, ex.w, currentTier, currentDate);
 }
 
-// Row-style parts use the same adaptive engine and tier policy.
-function getSmartNextPart(sessions, ex, part, currentTier = null) {
+function getSmartNextPart(sessions, ex, part, currentTier = null, currentDate = new Date()) {
   const history = getHistory(sessions, ex.id, part.alt, part.field);
-  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w, currentTier);
+  return smartCore(history, { inc: part.inc, down: !!part.down }, ex, ex.sets, part.w, currentTier, currentDate);
 }
 function getStats(sessions, id, target = null, down = false, altId = null) {
   const hist = getHistory(sessions, id, altId);
   if (hist.length === 0) return null;
   const current = hist[hist.length - 1].weight;
   const pr = down ? Math.min(...hist.map(h => h.weight)) : Math.max(...hist.map(h => h.weight));
-  const isPR = current === pr;
-  if (hist.length < 2) return {
-    current,
-    pr,
-    isPR,
-    ratePerWeek: null
-  };
-  const sample = hist.slice(-8);
-  const n = sample.length;
-  const t0 = new Date(sample[0].date).getTime();
-  const xs = sample.map(h => (new Date(h.date).getTime() - t0) / (86400000 * 7));
-  const ys = sample.map(h => h.weight);
-  const sx = xs.reduce((a, b) => a + b, 0),
-    sy = ys.reduce((a, b) => a + b, 0);
-  const sxx = xs.reduce((a, b) => a + b * b, 0),
-    sxy = xs.reduce((a, v, i) => a + v * ys[i], 0);
-  const slope = (n * sxy - sx * sy) / (n * sxx - sx * sx || 1);
-  let projection = null;
-  if (target != null && slope !== 0) {
-    const weeksToSep = (cfgDeadline() - new Date()) / (86400000 * 7);
-    if (weeksToSep <= 0) {
-      // Season boundary has passed — no pace math, just flag the cycle as ended.
-      return { current, pr, isPR, ratePerWeek: Math.round(slope * 10) / 10, projection: { expired: true } };
-    }
-    const remaining = down ? current - target : target - current;
-    const effectiveSlope = down ? -slope : slope;
-    if (effectiveSlope > 0) {
-      const weeksNeeded = remaining / effectiveSlope;
-      projection = {
-        weeksNeeded: Math.round(weeksNeeded),
-        onTrack: weeksNeeded <= weeksToSep,
-        weeksOff: Math.round(Math.abs(weeksToSep - weeksNeeded))
-      };
-    } else {
-      projection = {
-        stalled: true
-      };
-    }
-  }
-  return {
-    current,
-    pr,
-    isPR,
-    ratePerWeek: Math.round(slope * 10) / 10,
-    projection
-  };
+  const previous = hist.length > 1 ? hist[hist.length - 2].weight : null;
+  return { current, pr, isPR: current === pr, attempts: hist.length, previous, lastDate: hist[hist.length - 1].date };
 }
 
 // ─── THEME ───────────────────────────────────────────────────────────────────
@@ -777,9 +711,7 @@ function SvgChart({
   data,
   color,
   target,
-  down,
-  rate,
-  inc
+  down
 }) {
   if (!data || data.length < 2) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -801,21 +733,8 @@ function SvgChart({
     cW = W - PL - PR,
     cH = H - PT - PB;
   const vals = data.map(d => d.weight);
-  const weeksToSep = Math.max(0, (cfgDeadline() - new Date()) / (86400000 * 7));
-  // GOAL = current trend projected to the end of the season. Drawn ONLY when the trend
-  // moves toward the goal (up-lifts: rate>0; assist-lifts: rate<0) — a stalled
-  // or regressing trend is reported by the RATE stat, not by planting a doom
-  // marker that warps the axis. Rate is already signed; capped at one
-  // increment/week, the fastest the progression engine can award.
-  let projVal = null;
-  if (rate && weeksToSep > 0 && (down ? rate < 0 : rate > 0)) {
-    const cap = inc || 5;
-    const r = Math.max(-cap, Math.min(cap, rate));
-    projVal = Math.max(0, round2_5(data[data.length - 1].weight + r * weeksToSep));
-  }
   const allV = [...vals];
-  if (target) allV.push(target);
-  if (projVal) allV.push(projVal);
+  if (target != null) allV.push(target);
   const rawMin = Math.min(...allV),
     rawMax = Math.max(...allV),
     pad = (rawMax - rawMin) * 0.18 || 6;
@@ -830,9 +749,6 @@ function SvgChart({
   const pathD = data.map((d, i) => `${i === 0 ? "M" : "L"}${sx(i).toFixed(1)},${sy(d.weight).toFixed(1)}`).join(" ");
   const areaD = `${pathD} L${sx(data.length - 1).toFixed(1)},${cH} L0,${cH} Z`;
   const prVal = down ? Math.min(...vals) : Math.max(...vals);
-  const lX = sx(data.length - 1),
-    lY = sy(data[data.length - 1].weight);
-  const pY = projVal != null ? sy(projVal) : null;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       background: C.card,
@@ -893,31 +809,7 @@ function SvgChart({
     fill: C.green,
     fontSize: "9",
     fontFamily: mono
-  }, "TGT")), projVal != null && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("line", {
-    x1: lX.toFixed(1),
-    y1: lY.toFixed(1),
-    x2: cW,
-    y2: pY.toFixed(1),
-    stroke: C.green,
-    strokeDasharray: "4,4",
-    strokeWidth: "1.5",
-    opacity: "0.5"
-  }), /*#__PURE__*/React.createElement("circle", {
-    cx: cW,
-    cy: pY.toFixed(1),
-    r: "4",
-    fill: "none",
-    stroke: C.green,
-    strokeWidth: "1.5",
-    opacity: "0.7"
-  }), /*#__PURE__*/React.createElement("text", {
-    x: cW + 3,
-    y: pY - 6,
-    fill: C.green,
-    fontSize: "9",
-    fontFamily: mono,
-    opacity: "0.8"
-  }, "GOAL")), /*#__PURE__*/React.createElement("path", {
+  }, "TGT")), /*#__PURE__*/React.createElement("path", {
     d: areaD,
     fill: "url(#aG)"
   }), /*#__PURE__*/React.createElement("path", {
@@ -1004,7 +896,6 @@ function PlanPanel({
   const [sched, setSched] = useState({
     ...CFG.sched
   });
-  const [rationales, setRationales] = useState({});
   const [saved, setSaved] = useState(false);
   const CODES = ["A", "B", "J", "R"];
   const CODE_COLOR = {
@@ -1018,36 +909,6 @@ function PlanPanel({
     ...t,
     [f]: v
   } : t));
-  const roundU = (t, v) => t.unit === "sec" ? Math.round(v / 5) * 5 : round2_5(v);
-  const weeksLeft = () => Math.max(0, (cfgDeadline() - new Date()) / (86400000 * 7));
-  const statRow = t => {
-    const field = t.id === "row" ? "weight" : undefined;
-    const st = getStats(sessions, t.id, null, t.down, t.altId);
-    return { current: st ? st.current : null, rate: st ? st.ratePerWeek : null };
-  };
-  // Re-anchor the cycle to today's numbers and project targets from observed trends.
-  const prefillFromTrends = () => {
-    const wl = weeksLeft();
-    setTgts(p => p.map(t => {
-      const { current, rate } = statRow(t);
-      if (current == null) return t;
-      let target = t.target;
-      if (rate != null && rate !== 0 && wl > 0) {
-        // Early-phase trends are steep; the app can't award progress faster than
-        // one increment per week anyway, so cap the projection there.
-        const inc = (PROG[t.id] && PROG[t.id].inc) || 5;
-        const capped = Math.max(-inc, Math.min(inc, rate));
-        const projected = current + capped * wl; // signed (negative = assist dropping)
-        target = t.down ? Math.max(0, roundU(t, Math.min(current, projected))) : roundU(t, Math.max(current, projected));
-      }
-      // Never leave a zero-width cycle (target === start breaks progress math)
-      const inc2 = (PROG[t.id] && PROG[t.id].inc) || 5;
-      if (!t.down && Number(target) <= current) target = roundU(t, current + inc2);
-      if (t.down && Number(target) >= current) target = Math.max(0, roundU(t, current - inc2));
-      return { ...t, start: String(current), target: String(target) };
-    }));
-    setRationales({});
-  };
   const useCurrent = () => setTgts(p => p.map(t => {
     const lw = getLastW(sessions, t.id, t.altId);
     return lw != null ? {
@@ -1171,36 +1032,12 @@ function PlanPanel({
     }
   }, t.label, t.down ? " \u2193" : "", t.unit === "sec" ? /*#__PURE__*/React.createElement("span", {
     style: { color: C.muted, fontSize: 10 }
-  }, " (sec)") : null, rationales[t.id] && /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.amber,
-      fontSize: 10,
-      marginTop: 2,
-      lineHeight: 1.3
-    }
-  }, "\u26A1 ", rationales[t.id])), numIn(t.start, v => setT(i, "start", v)), /*#__PURE__*/React.createElement("span", {
+  }, " (sec)") : null), numIn(t.start, v => setT(i, "start", v)), /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.muted,
       fontSize: 12
     }
   }, "\u2192"), numIn(t.target, v => setT(i, "target", v)))), /*#__PURE__*/React.createElement("button", {
-    onClick: prefillFromTrends,
-    style: {
-      width: "100%",
-      padding: "9px",
-      background: "none",
-      border: `1px solid ${C.amber}60`,
-      borderRadius: 8,
-      color: C.amber,
-      cursor: "pointer",
-      fontSize: 11,
-      letterSpacing: 1.5,
-      fontWeight: 700,
-      fontFamily: sans,
-      marginTop: 2,
-      marginBottom: 8
-    }
-  }, "\uD83D\uDCC8 PREFILL FROM TRENDS"), /*#__PURE__*/React.createElement("button", {
     onClick: useCurrent,
     style: {
       width: "100%",
@@ -1216,7 +1053,14 @@ function PlanPanel({
       fontFamily: sans,
       marginTop: 2
     }
-  }, "USE CURRENT WEIGHTS AS START"), secLabel("WEEKLY SCHEDULE \xB7 TAP TO CYCLE"), /*#__PURE__*/React.createElement("div", {
+  }, "USE CURRENT WEIGHTS AS START"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: C.muted,
+      fontSize: 10,
+      lineHeight: 1.5,
+      marginTop: 8
+    }
+  }, "Targets are reference goals only. Next loads, returns, stalls and deloads come from the adaptive season + session-tier engine."), secLabel("WEEKLY SCHEDULE \xB7 TAP TO CYCLE"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 5
@@ -2153,7 +1997,7 @@ function HomeView({
       fontWeight: 700,
       marginRight: 4
     }
-  }, "TIER"), ['11', '9', '7'].map(m => /*#__PURE__*/React.createElement("div", {
+  }, "SESSION TIER"), ['11', '9', '7'].map(m => /*#__PURE__*/React.createElement("div", {
     key: m,
     onClick: () => onSetTier(m),
     style: {
@@ -2257,15 +2101,22 @@ function HomeView({
       fontWeight: 700,
       marginBottom: 16
     }
-  }, "TARGETS \xB7 ", cfgLabel()), CFG.targets.map(t => {
+  }, "TARGETS \xB7 ", cfgLabel()), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: seasonAt().color,
+      fontSize: 10,
+      letterSpacing: 1.3,
+      fontWeight: 700,
+      marginTop: -8,
+      marginBottom: 14
+    }
+  }, progressionContext(tier).label), CFG.targets.map(t => {
     const lw = getLastW(sessions, t.id, t.altId);
     let pct = 0;
     if (lw != null) pct = t.down ? Math.max(0, Math.min(100, (t.start - lw) / ((t.start - t.target) || 1) * 100)) : Math.max(0, Math.min(100, (lw - t.start) / ((t.target - t.start) || 1) * 100));
     const reached = lw != null && (t.down ? lw <= t.target : lw >= t.target);
     const ex = ALL_EX.find(e => e.id === t.id);
-    const stats = getStats(sessions, t.id, t.target, t.down, t.altId);
-    const proj = stats?.projection;
-    const rateGood = t.down ? (stats?.ratePerWeek || 0) < 0 : (stats?.ratePerWeek || 0) > 0;
+    const smart = ex ? getSmartNext(sessions, ex, tier) : null;
     return /*#__PURE__*/React.createElement("div", {
       key: t.id,
       style: {
@@ -2313,27 +2164,21 @@ function HomeView({
         gap: 12,
         fontSize: 11
       }
-    }, stats?.ratePerWeek != null && stats.ratePerWeek !== 0 && /*#__PURE__*/React.createElement("span", {
+    }, reached ? /*#__PURE__*/React.createElement("span", {
       style: {
-        color: rateGood ? C.green : C.sub
+        color: C.green,
+        fontWeight: 700
       }
-    }, t.down ? `${stats.ratePerWeek < 0 ? "" : "+"}${stats.ratePerWeek} ${t.unit || "lbs"} assist/wk` : `${stats.ratePerWeek > 0 ? "+" : ""}${stats.ratePerWeek} ${t.unit || "lbs"}/wk`), proj?.expired && !reached && /*#__PURE__*/React.createElement("span", {
+    }, "TARGET REACHED") : smart && smart.status !== "initial" ? /*#__PURE__*/React.createElement("span", {
       style: {
-        color: C.amber
+        color: smart.color,
+        fontWeight: 700
       }
-    }, "CYCLE ENDED \u2014 set new targets in \u2699\uFE0F"), proj && !proj.stalled && !proj.expired && !reached && /*#__PURE__*/React.createElement("span", {
+    }, smart.label, " · ", smart.policy) : /*#__PURE__*/React.createElement("span", {
       style: {
-        color: proj.onTrack ? C.green : C.danger
+        color: C.muted
       }
-    }, proj.onTrack ? `ON TRACK · ~${proj.weeksNeeded}w` : `${proj.weeksOff}w behind`), proj?.stalled && /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: C.danger
-      }
-    }, "STALLED"), reached && /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: C.green
-      }
-    }, "Target reached!")));
+    }, progressionContext(tier).label)));
   })), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "8px 20px 28px",
@@ -2600,7 +2445,10 @@ function ProgressView({
     }
   }, trackable.map(e => {
     const s = getSmartNext(sessions, e, tier);
-    const dot = s?.status === 'ready' ? C.green : s?.status === 'deload' ? C.danger : null;
+    const dot = s?.status === 'ready' ? C.green
+      : s?.status === 'deload' ? C.danger
+      : s && ['stall','return-down','repeat','season-shift','tier-build','building','reset'].includes(s.status) ? C.amber
+      : null;
     return /*#__PURE__*/React.createElement("button", {
       key: e.id,
       onClick: () => setSelId(e.id),
@@ -2694,19 +2542,11 @@ function ProgressView({
     val: tgt.target,
     unit: ex.unit,
     color: C.green
-  }), stats?.ratePerWeek != null && stats.ratePerWeek !== 0 && /*#__PURE__*/React.createElement(Stat, {
-    label: "RATE",
-    val: `${tgt?.down ? stats.ratePerWeek < 0 ? "" : "+" : stats.ratePerWeek > 0 ? "+" : ""}${stats.ratePerWeek}`,
-    unit: tgt?.down ? "lbs assist/wk" : "lbs/wk",
-    color: (tgt?.down ? stats.ratePerWeek < 0 : stats.ratePerWeek > 0) ? C.green : C.danger,
-    sub: stats?.projection?.expired ? "cycle ended" : stats?.projection?.onTrack ? "on track" : stats?.projection?.stalled ? "stalled" : stats?.projection ? `${stats.projection.weeksOff}w off pace` : ""
   })), /*#__PURE__*/React.createElement(SvgChart, {
     data: chartData,
     color: C.amber,
     target: tgt?.target,
-    down: tgt?.down,
-    rate: stats?.ratePerWeek,
-    inc: PROG[selId] && PROG[selId].inc || (ex && ex.parts ? ex.parts[0].inc : 5)
+    down: tgt?.down
   }), part2 && chartData2.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 14
@@ -2722,7 +2562,7 @@ function ProgressView({
   }, part2.label.toUpperCase(), " \u2014 GAP TO TWO-HAND = IMBALANCE"), /*#__PURE__*/React.createElement(SvgChart, {
     data: chartData2,
     color: C.blue
-  })), smart && smart.nextWeight != null && smart.status !== 'initial' && /*#__PURE__*/React.createElement("div", {
+  })), smart && smart.status !== 'initial' && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 16,
       background: C.surf,
@@ -2738,7 +2578,7 @@ function ProgressView({
       fontWeight: 700,
       marginBottom: 4
     }
-  }, "NEXT SESSION TARGET"), /*#__PURE__*/React.createElement("div", {
+  }, "ADAPTIVE NEXT LOAD"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -2757,7 +2597,7 @@ function ProgressView({
       fontWeight: 800,
       color: smart.color
     }
-  }, smart.status === "building" ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
+  }, smart.status === "building" || smart.nextWeight == null ? smart.currentWeight : smart.nextWeight, " ", /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       color: C.sub
@@ -2866,8 +2706,8 @@ function GymTracker() {
   const [tier, setTierState] = useState(() => {
     const season = seasonAt();
     const state = LS.get('lobo-gym-tier-state');
-    // Manual tier choices persist within a season only. Crossing a season
-    // boundary returns KITAE to that season's intended training tier.
+    // Tier is a session-volume choice, not the season identity. A Tier 9 day
+    // in fall is still JUDO · MAINTAIN. Crossing seasons resets only the default.
     if (state && state.seasonId === season.id && ['11', '9', '7'].includes(String(state.tier))) {
       return String(state.tier);
     }
@@ -2906,8 +2746,8 @@ function GymTracker() {
           ['11', '9', '7'].includes(String(tierState.tier))) {
         setTierState(String(tierState.tier));
       } else {
-        // New season (or v15.2 migration): use the season's training intent.
-        // The user can still override it manually for the rest of this season.
+        // New season: start from its suggested tier. The user can still choose
+        // Tier 7/9/11 on any day without changing the training phase.
         const seasonTier = String(season.tier);
         setTierState(seasonTier);
         DB.set("lobo-gym-tier", seasonTier);

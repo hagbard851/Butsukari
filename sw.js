@@ -1,4 +1,4 @@
-const CACHE_NAME = "butsukari-shell-v15.4";
+const CACHE_NAME = "butsukari-shell-v15.5";
 const APP_SHELL = ["./", "./index.html", "./manifest.webmanifest"];
 
 self.addEventListener("install", event => {
