@@ -712,9 +712,7 @@ function SvgChart({
   data,
   color,
   target,
-  down,
-  rate,
-  inc
+  down
 }) {
   if (!data || data.length < 2) return /*#__PURE__*/React.createElement("div", {
     style: {
@@ -736,21 +734,8 @@ function SvgChart({
     cW = W - PL - PR,
     cH = H - PT - PB;
   const vals = data.map(d => d.weight);
-  const weeksToSep = Math.max(0, (cfgDeadline() - new Date()) / (86400000 * 7));
-  // GOAL = current trend projected to the end of the season. Drawn ONLY when the trend
-  // moves toward the goal (up-lifts: rate>0; assist-lifts: rate<0) — a stalled
-  // or regressing trend is reported by the RATE stat, not by planting a doom
-  // marker that warps the axis. Rate is already signed; capped at one
-  // increment/week, the fastest the progression engine can award.
-  let projVal = null;
-  if (rate && weeksToSep > 0 && (down ? rate < 0 : rate > 0)) {
-    const cap = inc || 5;
-    const r = Math.max(-cap, Math.min(cap, rate));
-    projVal = Math.max(0, round2_5(data[data.length - 1].weight + r * weeksToSep));
-  }
   const allV = [...vals];
-  if (target) allV.push(target);
-  if (projVal) allV.push(projVal);
+  if (target != null) allV.push(target);
   const rawMin = Math.min(...allV),
     rawMax = Math.max(...allV),
     pad = (rawMax - rawMin) * 0.18 || 6;
@@ -767,7 +752,6 @@ function SvgChart({
   const prVal = down ? Math.min(...vals) : Math.max(...vals);
   const lX = sx(data.length - 1),
     lY = sy(data[data.length - 1].weight);
-  const pY = projVal != null ? sy(projVal) : null;
   return /*#__PURE__*/React.createElement("div", {
     style: {
       background: C.card,
@@ -828,31 +812,7 @@ function SvgChart({
     fill: C.green,
     fontSize: "9",
     fontFamily: mono
-  }, "TGT")), projVal != null && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("line", {
-    x1: lX.toFixed(1),
-    y1: lY.toFixed(1),
-    x2: cW,
-    y2: pY.toFixed(1),
-    stroke: C.green,
-    strokeDasharray: "4,4",
-    strokeWidth: "1.5",
-    opacity: "0.5"
-  }), /*#__PURE__*/React.createElement("circle", {
-    cx: cW,
-    cy: pY.toFixed(1),
-    r: "4",
-    fill: "none",
-    stroke: C.green,
-    strokeWidth: "1.5",
-    opacity: "0.7"
-  }), /*#__PURE__*/React.createElement("text", {
-    x: cW + 3,
-    y: pY - 6,
-    fill: C.green,
-    fontSize: "9",
-    fontFamily: mono,
-    opacity: "0.8"
-  }, "GOAL")), /*#__PURE__*/React.createElement("path", {
+  }, "TGT")), /*#__PURE__*/React.createElement("path", {
     d: areaD,
     fill: "url(#aG)"
   }), /*#__PURE__*/React.createElement("path", {
@@ -939,7 +899,6 @@ function PlanPanel({
   const [sched, setSched] = useState({
     ...CFG.sched
   });
-  const [rationales, setRationales] = useState({});
   const [saved, setSaved] = useState(false);
   const CODES = ["A", "B", "J", "R"];
   const CODE_COLOR = {
@@ -953,36 +912,6 @@ function PlanPanel({
     ...t,
     [f]: v
   } : t));
-  const roundU = (t, v) => t.unit === "sec" ? Math.round(v / 5) * 5 : round2_5(v);
-  const weeksLeft = () => Math.max(0, (cfgDeadline() - new Date()) / (86400000 * 7));
-  const statRow = t => {
-    const field = t.id === "row" ? "weight" : undefined;
-    const st = getStats(sessions, t.id, null, t.down, t.altId);
-    return { current: st ? st.current : null, rate: st ? st.ratePerWeek : null };
-  };
-  // Re-anchor the cycle to today's numbers and project targets from observed trends.
-  const prefillFromTrends = () => {
-    const wl = weeksLeft();
-    setTgts(p => p.map(t => {
-      const { current, rate } = statRow(t);
-      if (current == null) return t;
-      let target = t.target;
-      if (rate != null && rate !== 0 && wl > 0) {
-        // Early-phase trends are steep; the app can't award progress faster than
-        // one increment per week anyway, so cap the projection there.
-        const inc = (PROG[t.id] && PROG[t.id].inc) || 5;
-        const capped = Math.max(-inc, Math.min(inc, rate));
-        const projected = current + capped * wl; // signed (negative = assist dropping)
-        target = t.down ? Math.max(0, roundU(t, Math.min(current, projected))) : roundU(t, Math.max(current, projected));
-      }
-      // Never leave a zero-width cycle (target === start breaks progress math)
-      const inc2 = (PROG[t.id] && PROG[t.id].inc) || 5;
-      if (!t.down && Number(target) <= current) target = roundU(t, current + inc2);
-      if (t.down && Number(target) >= current) target = Math.max(0, roundU(t, current - inc2));
-      return { ...t, start: String(current), target: String(target) };
-    }));
-    setRationales({});
-  };
   const useCurrent = () => setTgts(p => p.map(t => {
     const lw = getLastW(sessions, t.id, t.altId);
     return lw != null ? {
@@ -1106,36 +1035,12 @@ function PlanPanel({
     }
   }, t.label, t.down ? " \u2193" : "", t.unit === "sec" ? /*#__PURE__*/React.createElement("span", {
     style: { color: C.muted, fontSize: 10 }
-  }, " (sec)") : null, rationales[t.id] && /*#__PURE__*/React.createElement("div", {
-    style: {
-      color: C.amber,
-      fontSize: 10,
-      marginTop: 2,
-      lineHeight: 1.3
-    }
-  }, "\u26A1 ", rationales[t.id])), numIn(t.start, v => setT(i, "start", v)), /*#__PURE__*/React.createElement("span", {
+  }, " (sec)") : null), numIn(t.start, v => setT(i, "start", v)), /*#__PURE__*/React.createElement("span", {
     style: {
       color: C.muted,
       fontSize: 12
     }
   }, "\u2192"), numIn(t.target, v => setT(i, "target", v)))), /*#__PURE__*/React.createElement("button", {
-    onClick: prefillFromTrends,
-    style: {
-      width: "100%",
-      padding: "9px",
-      background: "none",
-      border: `1px solid ${C.amber}60`,
-      borderRadius: 8,
-      color: C.amber,
-      cursor: "pointer",
-      fontSize: 11,
-      letterSpacing: 1.5,
-      fontWeight: 700,
-      fontFamily: sans,
-      marginTop: 2,
-      marginBottom: 8
-    }
-  }, "\uD83D\uDCC8 PREFILL FROM TRENDS"), /*#__PURE__*/React.createElement("button", {
     onClick: useCurrent,
     style: {
       width: "100%",
@@ -2536,7 +2441,10 @@ function ProgressView({
     }
   }, trackable.map(e => {
     const s = getSmartNext(sessions, e, tier);
-    const dot = s?.status === 'ready' ? C.green : s?.status === 'deload' ? C.danger : null;
+    const dot = s?.status === 'ready' ? C.green
+      : s?.status === 'deload' ? C.danger
+      : s && ['stall','return-down','repeat','season-shift','tier-build','building','reset'].includes(s.status) ? C.amber
+      : null;
     return /*#__PURE__*/React.createElement("button", {
       key: e.id,
       onClick: () => setSelId(e.id),
@@ -2630,19 +2538,11 @@ function ProgressView({
     val: tgt.target,
     unit: ex.unit,
     color: C.green
-  }), stats?.ratePerWeek != null && stats.ratePerWeek !== 0 && /*#__PURE__*/React.createElement(Stat, {
-    label: "RATE",
-    val: `${tgt?.down ? stats.ratePerWeek < 0 ? "" : "+" : stats.ratePerWeek > 0 ? "+" : ""}${stats.ratePerWeek}`,
-    unit: tgt?.down ? "lbs assist/wk" : "lbs/wk",
-    color: (tgt?.down ? stats.ratePerWeek < 0 : stats.ratePerWeek > 0) ? C.green : C.danger,
-    sub: stats?.projection?.expired ? "cycle ended" : stats?.projection?.onTrack ? "on track" : stats?.projection?.stalled ? "stalled" : stats?.projection ? `${stats.projection.weeksOff}w off pace` : ""
   })), /*#__PURE__*/React.createElement(SvgChart, {
     data: chartData,
     color: C.amber,
     target: tgt?.target,
-    down: tgt?.down,
-    rate: stats?.ratePerWeek,
-    inc: PROG[selId] && PROG[selId].inc || (ex && ex.parts ? ex.parts[0].inc : 5)
+    down: tgt?.down
   }), part2 && chartData2.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       marginTop: 14
